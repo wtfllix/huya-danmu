@@ -1,5 +1,5 @@
 const huya_danmu = require('./index')
-const roomid = 'edc595'
+const roomid = process.argv[2] || '1995'
 const client = new huya_danmu(roomid)
 
 client.on('connect', () => {
@@ -21,7 +21,7 @@ client.on('message', msg => {
 })
 
 client.on('error', e => {
-    console.log(e)
+    console.log('error:', e.message)
 })
 
 client.on('close', () => {

@@ -1,240 +1,365 @@
+// huya-danmu v3 — 虎牙直播弹幕监听(新版协议)
+// 协议:ws://ws.api.huya.com → wsLaunch(WUP) → registerGroup(["live:<uid>","chat:<uid>"]) → 实时消息
+// 消息 URI:1400=弹幕 6501=礼物 8006=人气
+// 与原版 API 完全兼容:new huya_danmu(roomid), on('message'|'connect'|'error'|'close'), start()/stop()
 const ws = require('ws')
-const md5 = require('md5')
+const https = require('https')
+const http = require('http')
+const crypto = require('crypto')
 const events = require('events')
-const request = require('request-promise')
-const to_arraybuffer = require('to-arraybuffer')
-const socks_agent = require('socks-proxy-agent')
-const { Taf, TafMx, HUYA, List } = require('./lib')
+const { Taf, HUYA } = require('./lib')
 
-const timeout = 30000
-const heartbeat_interval = 60000
-const fresh_gift_interval = 60 * 60 * 1000
-const r = request.defaults({ json: true, gzip: true, timeout: timeout, headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 5.1.1; Nexus 6 Build/LYZ28E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.84 Mobile Safari/537.36' } })
+// ---- Taf.Wup.readFrom 补丁:新版响应带 context/status map,需要默认 Map 类 ----
+Taf.Wup.prototype.readFrom = function (t) {
+  this.iVersion = t.readInt16(1, true)
+  this.cPacketType = t.readInt8(2, true)
+  this.iMessageType = t.readInt32(3, true)
+  this.iRequestId = t.readInt32(4, true)
+  this.sServantName = t.readString(5, true)
+  this.sFuncName = t.readString(6, true)
+  this.sBuffer = t.readBytes(7, true)
+  this.iTimeout = t.readInt32(8, true)
+  this.context = t.readMap(9, true, new Taf.Map(new Taf.STRING, new Taf.STRING))
+  this.status = t.readMap(10, true, new Taf.Map(new Taf.STRING, new Taf.STRING))
+}
+
+// WebSocketCommand 类型(新版协议)
+const CMD = {
+  WupReq: 3,
+  WupRsp: 4,
+  S2C_MsgPushReq: 7,
+  C2S_RegisterGroupReq: 16,
+  S2C_RegisterGroupRsp: 17,
+  C2S_HeartBeatReq: 20,
+  S2C_HeartBeatRsp: 21,
+  S2C_MsgPushReq_V2: 22,
+}
+
+const WS_URL = 'ws://ws.api.huya.com'
+const HEARTBEAT_INTERVAL = 60000
+const UA = 'Mozilla/5.0 (Linux; Android 5.1.1; Nexus 6 Build/LYZ28E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.84 Mobile Safari/537.36'
+
+function toAB(b) { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }
+function md5(s) { return crypto.createHash('md5').update(String(s)).digest('hex') }
 
 class huya_danmu extends events {
+  constructor(opt) {
+    super()
+    if (typeof opt === 'string') {
+      this._roomid = opt
+    } else if (typeof opt === 'object') {
+      this._roomid = opt.roomid
+      if (opt.proxy) this._proxy = opt.proxy
+    }
+    this._gift_info = {}
+    this._starting = false
+    this._stopped = false
+    this._retry = 0
+  }
 
-    constructor(opt) {
-        super()
-        if (typeof opt === 'string')
-            this._roomid = opt
-        else if (typeof opt === 'object') {
-            this._roomid = opt.roomid
-            this.set_proxy(opt.proxy)
+  // ---------- 页面请求 ----------
+  _fetch(url) {
+    return new Promise((resolve, reject) => {
+      const mod = url.startsWith('https') ? https : http
+      const req = mod.get(url, { headers: { 'User-Agent': UA } }, res => {
+        let d = ''
+        res.on('data', c => (d += c))
+        res.on('end', () => resolve(d))
+      })
+      req.on('error', reject)
+      req.setTimeout(15000, () => req.destroy(new Error('request timeout')))
+    })
+  }
+
+  // 从新版页面 HNF_GLOBAL_INIT 提取主播 uid(不再需要 SUBSID/TOPSID)
+  async _get_uid() {
+    const body = await this._fetch(`https://m.huya.com/${this._roomid}`)
+    const m = body.match(/"lUid"\s*:\s*(\d+)/)
+    if (!m) throw new Error('无法从页面获取 lUid,房间可能不存在')
+    return parseInt(m[1])
+  }
+
+  // ---------- 生命周期 ----------
+  async start() {
+    if (this._starting) return
+    this._starting = true
+    this._stopped = false
+    try {
+      this._yyuid = await this._get_uid()
+    } catch (e) {
+      this._starting = false
+      this.emit('error', e)
+      this.emit('close')
+      return
+    }
+    this._connect()
+  }
+
+  _connect() {
+    const opt = { perMessageDeflate: false }
+    if (this._proxy) {
+      const { SocksProxyAgent } = require('socks-proxy-agent')
+      opt.agent = new SocksProxyAgent(this._proxy)
+    }
+    const client = new ws(WS_URL, opt)
+    this._client = client
+    client.on('open', () => this._on_open())
+    client.on('message', data => this._on_message(data))
+    client.on('error', err => this.emit('error', err))
+    client.on('close', () => this._on_close())
+  }
+
+  _on_open() {
+    this._retry = 0
+    this.emit('connect')
+    // 1) wsLaunch
+    const wup = new Taf.Wup()
+    wup.setServant('launch')
+    wup.setFunc('wsLaunch')
+    wup.setRequestId(1)
+    wup.writeStruct('tReq', this._make_launch_req())
+    this._send_ws_cmd(CMD.WupReq, wup.encode())
+    // 心跳
+    clearInterval(this._heartbeat_timer)
+    this._heartbeat_timer = setInterval(() => this._heartbeat(), HEARTBEAT_INTERVAL)
+  }
+
+  _make_launch_req() {
+    const r = {}
+    r.lUid = this._yyuid
+    r.sGuid = ''
+    r.sUA = 'webh5&1.0.0&websocket'
+    r.sAppSrc = ''
+    r.tDeviceInfo = {}
+    r.tDeviceInfo.writeTo = function (t) { for (let i = 0; i < 5; i++) t.writeString(i, '') }
+    r.writeTo = function (t) {
+      t.writeInt64(0, this.lUid)
+      t.writeString(1, this.sGuid)
+      t.writeString(2, this.sUA)
+      t.writeString(3, this.sAppSrc)
+      t.writeStruct(4, this.tDeviceInfo)
+    }
+    return r
+  }
+
+  // 2) 注册弹幕组
+  _register_group() {
+    const g = {}
+    g.vGroupId = [`live:${this._yyuid}`, `chat:${this._yyuid}`]
+    g.sToken = ''
+    g.writeTo = function (t) {
+      t.writeTo(0, Taf.DataHelp.EN_LIST)
+      t.writeInt32(0, this.vGroupId.length)
+      for (const x of this.vGroupId) t.writeString(0, x)
+      t.writeString(1, this.sToken)
+    }
+    const s = new Taf.JceOutputStream()
+    g.writeTo(s)
+    this._send_ws_cmd(CMD.C2S_RegisterGroupReq, s.getBinBuffer())
+  }
+
+  // 3) 拉取礼物名称表
+  _get_gift_list() {
+    const req = new HUYA.GetPropsListReq()
+    const uid = new HUYA.UserId()
+    uid.lUid = this._yyuid
+    uid.sHuYaUA = 'webh5&1.0.0&websocket'
+    req.tUserId = uid
+    req.iTemplateType = HUYA.EClientTemplateType.TPL_WEB
+    this._send_wup('PropsUIServer', 'getPropsList', req, 3)
+  }
+
+  _heartbeat() {
+    this._send_ws_cmd(CMD.C2S_HeartBeatReq, null)
+  }
+
+  // ---------- 发送 ----------
+  _send_ws_cmd(cmdType, vData) {
+    if (!this._client || this._client.readyState !== ws.OPEN) return
+    const cmd = new HUYA.WebSocketCommand()
+    cmd.iCmdType = cmdType
+    if (vData) cmd.vData = vData
+    const s = new Taf.JceOutputStream()
+    cmd.writeTo(s)
+    this._client.send(s.getBuffer())
+  }
+
+  _send_wup(servant, func, reqObj, requestId) {
+    const wup = new Taf.Wup()
+    wup.setServant(servant)
+    wup.setFunc(func)
+    wup.setRequestId(requestId || 2)
+    wup.writeStruct('tReq', reqObj)
+    this._send_ws_cmd(CMD.WupReq, wup.encode())
+  }
+
+  // ---------- 接收 ----------
+  _on_message(data) {
+    try {
+      const cmd = new HUYA.WebSocketCommand()
+      cmd.readFrom(new Taf.JceInputStream(toAB(Buffer.from(data))))
+      switch (cmd.iCmdType) {
+        case CMD.WupRsp:
+          this._on_wup_rsp(cmd)
+          break
+        case CMD.S2C_RegisterGroupRsp:
+          this._get_gift_list()
+          break
+        case CMD.S2C_HeartBeatRsp:
+          break
+        case CMD.S2C_MsgPushReq:
+          this._on_push_v1(cmd)
+          break
+        case CMD.S2C_MsgPushReq_V2:
+          this._on_push_v2(cmd)
+          break
+        default:
+          break
+      }
+    } catch (e) {
+      this.emit('error', e)
+    }
+  }
+
+  _on_wup_rsp(cmd) {
+    const wup = new Taf.Wup()
+    wup.decode(cmd.vData.buffer)
+    if (wup.sFuncName === 'wsLaunch') {
+      this._register_group()
+    } else if (wup.sFuncName === 'getPropsList') {
+      try {
+        const rsp = new HUYA.GetPropsListRsp()
+        new Taf.JceInputStream(wup.newdata.get('tRsp').buffer).readStruct(0, true, rsp)
+        rsp.vPropsItemList.value.forEach(item => {
+          this._gift_info[item.iPropsId + ''] = { name: item.sPropsName, price: item.iPropsYb / 100 }
+        })
+      } catch (e) { /* 礼物表失败不影响主流程 */ }
+    }
+  }
+
+  _on_push_v1(cmd) {
+    const msg = {}
+    msg.readFrom = function (t) {
+      this.iUri = t.readInt32(1, true, 0)
+      this.sMsg = t.readBytes(2, true, null)
+    }
+    msg.readFrom(new Taf.JceInputStream(cmd.vData.buffer))
+    if (msg.sMsg) this._handle_uri(msg.iUri, msg.sMsg.buffer)
+  }
+
+  _on_push_v2(cmd) {
+    const v2 = {}
+    v2.readFrom = function (t) {
+      this.sGroupId = t.readString(0, true, '')
+      const head = t.readFrom()
+      const items = []
+      if (head.type === Taf.DataHelp.EN_LIST) {
+        const n = t.readInt32(0, true)
+        for (let i = 0; i < n; i++) {
+          const item = {}
+          item.readFrom = function (tt) {
+            this.iUri = tt.readInt64(0, true, 0)
+            this.sMsg = tt.readBytes(1, true, null)
+          }
+          try {
+            item.readFrom(t)
+            items.push(item)
+          } catch (e) { break /* 解析失败中断,避免流错位 */ }
         }
-        this._gift_info = {}
-        this._chat_list = new List()
-        this._emitter = new events.EventEmitter()
+      }
+      this.vMsgItem = items
     }
-
-    set_proxy(proxy) {
-        this._agent = new socks_agent(proxy)
+    v2.readFrom(new Taf.JceInputStream(cmd.vData.buffer))
+    for (const item of v2.vMsgItem) {
+      if (!item.sMsg) continue
+      try {
+        this._handle_uri(item.iUri, item.sMsg.buffer)
+      } catch (e) { /* 单条 item 失败跳过 */ }
     }
+  }
 
-    async _get_chat_info() {
-        try {
-            let body = await r({
-                url: `https://m.huya.com/${this._roomid}`,
-                agent: this._agent
-            })
-            let info = {}
-            let subsid_array = body.match(/var SUBSID = '(.*)';/)
-            let topsid_array = body.match(/var TOPSID = '(.*)';/)
-            let yyuid_array = body.match(/ayyuid: '(.*)',/)
-            if (!subsid_array || !topsid_array || !yyuid_array) return
-            info.subsid = subsid_array[1] === '' ? 0 : parseInt(subsid_array[1])
-            info.topsid = topsid_array[1] === '' ? 0 : parseInt(topsid_array[1])
-            info.yyuid = parseInt(yyuid_array[1])
-            return info
-        } catch (e) {
-            this.emit('error', new Error('Fail to get info'))
+  _handle_uri(uri, ab) {
+    try {
+      if (uri === 1400) {
+        // 弹幕 MessageNotice: tUserInfo(0) lTid(1) sContent(3)
+        const s = new Taf.JceInputStream(ab)
+        const chat = {}
+        chat.readFrom = function (t) {
+          const u = {}
+          u.readFrom = function (tt) {
+            this.lUid = tt.readInt64(0, true, 0)
+            this.sNickName = tt.readString(2, true, '')
+          }
+          this.tUserInfo = t.readStruct(0, true, u)
+          this.sContent = t.readString(3, true, '')
         }
-    }
-
-    async start() {
-        if (this._starting) return
-        this._starting = true
-        this._info = await this._get_chat_info()
-        if (!this._info) return this.emit('close')
-        this._main_user_id = new HUYA.UserId()
-        this._main_user_id.lUid = this._info.yyuid
-        this._main_user_id.sHuYaUA = "webh5&1.0.0&websocket"
-        this._start_ws()
-    }
-
-    _start_ws() {
-        this._client = new ws('ws://ws.api.huya.com', {
-            perMessageDeflate: false,
-            agent: this._agent
+        chat.readFrom(s)
+        this.emit('message', {
+          type: 'chat',
+          time: Date.now(),
+          from: { name: chat.tUserInfo.sNickName, rid: String(chat.tUserInfo.lUid) },
+          id: md5(JSON.stringify(chat)),
+          content: chat.sContent,
         })
-        this._client.on('open', () => {
-            this._get_gift_list()
-            this._bind_ws_info()
-            this._heartbeat()
-            this._heartbeat_timer = setInterval(this._heartbeat.bind(this), heartbeat_interval)
-            this._fresh_gift_list_timer = setInterval(this._get_gift_list.bind(this), fresh_gift_interval)
-            this.emit('connect')
-        })
-        this._client.on('error', err => {
-            this.emit('error', err)
-        })
-        this._client.on('close', async () => {
-            this._stop()
-            this.emit('close')
-        })
-        this._client.on('message', this._on_mes.bind(this))
-        this._emitter.on("8006", msg => {
-            const msg_obj = {
-                type: 'online',
-                time: new Date().getTime(),
-                count: msg.iAttendeeCount
-            }
-            this.emit('message', msg_obj)
-        })
-        this._emitter.on("1400", msg => {
-            const msg_obj = {
-                type: 'chat',
-                time: new Date().getTime(),
-                from: {
-                    name: msg.tUserInfo.sNickName,
-                    rid: msg.tUserInfo.lUid + '',
-                },
-                id: md5(JSON.stringify(msg)),
-                content: msg.sContent
-            }
-            const can_emit = this._chat_list.push(msg_obj.from.rid + msg_obj.content, msg_obj.time)
-            can_emit && this.emit('message', msg_obj)
-        })
-        this._emitter.on("6501", msg => {
-            if (msg.lPresenterUid != this._info.yyuid) return
-            let gift = this._gift_info[msg.iItemType + ''] || { name: '未知礼物', price: 0 }
-            let id = md5(JSON.stringify(msg))
-            let msg_obj = {
-                type: 'gift',
-                time: new Date().getTime(),
-                name: gift.name,
-                from: {
-                    name: msg.sSenderNick,
-                    rid: msg.lSenderUid + ''
-                },
-                count: msg.iItemCount,
-                price: msg.iItemCount * gift.price,
-                earn: msg.iItemCount * gift.price,
-                id: id
-            }
-            this.emit('message', msg_obj)
-        })
-        this._emitter.on("getPropsList", msg => {
-            msg.vPropsItemList.value.forEach(item => {
-                this._gift_info[item.iPropsId + ''] = {
-                    name: item.sPropsName,
-                    price: item.iPropsYb / 100
-                }
-            })
-        })
-    }
-
-    _get_gift_list() {
-        let prop_req = new HUYA.GetPropsListReq()
-        prop_req.tUserId = this._main_user_id
-        prop_req.iTemplateType = HUYA.EClientTemplateType.TPL_MIRROR
-        this._send_wup("PropsUIServer", "getPropsList", prop_req)
-    }
-
-    _bind_ws_info() {
-        let ws_user_info = new HUYA.WSUserInfo;
-        ws_user_info.lUid = this._info.yyuid
-        ws_user_info.bAnonymous = 0 == this._info.yyuid
-        ws_user_info.sGuid = this._main_user_id.sGuid
-        ws_user_info.sToken = ""
-        ws_user_info.lTid = this._info.topsid
-        ws_user_info.lSid = this._info.subsid
-        ws_user_info.lGroupId = this._info.yyuid
-        ws_user_info.lGroupType = 3
-        let jce_stream = new Taf.JceOutputStream()
-        ws_user_info.writeTo(jce_stream)
-        let ws_command = new HUYA.WebSocketCommand()
-        ws_command.iCmdType = HUYA.EWebSocketCommandType.EWSCmd_RegisterReq
-        ws_command.vData = jce_stream.getBinBuffer()
-        jce_stream = new Taf.JceOutputStream()
-        ws_command.writeTo(jce_stream)
-        this._client.send(jce_stream.getBuffer())
-    }
-
-    _heartbeat() {
-        let heart_beat_req = new HUYA.UserHeartBeatReq()
-        let user_id = new HUYA.UserId()
-        user_id.sHuYaUA = "webh5&1.0.0&websocket"
-        heart_beat_req.tId = user_id
-        heart_beat_req.lTid = this._info.topsid
-        heart_beat_req.lSid = this._info.subsid
-        heart_beat_req.lPid = this._info.yyuid
-        heart_beat_req.eLineType = 1
-        this._send_wup("onlineui", "OnUserHeartBeat", heart_beat_req)
-    }
-
-    _on_mes(data) {
-        try {
-            data = to_arraybuffer(data)
-            let stream = new Taf.JceInputStream(data)
-            let command = new HUYA.WebSocketCommand()
-            command.readFrom(stream)
-            switch (command.iCmdType) {
-                case HUYA.EWebSocketCommandType.EWSCmd_WupRsp:
-                    let wup = new Taf.Wup()
-                    wup.decode(command.vData.buffer)
-                    let map = new (TafMx.WupMapping[wup.sFuncName])()
-                    wup.readStruct('tRsp', map, TafMx.WupMapping[wup.sFuncName])
-                    this._emitter.emit(wup.sFuncName, map)
-                    break
-                case HUYA.EWebSocketCommandType.EWSCmdS2C_MsgPushReq:
-                    stream = new Taf.JceInputStream(command.vData.buffer)
-                    let msg = new HUYA.WSPushMessage()
-                    msg.readFrom(stream)
-                    stream = new Taf.JceInputStream(msg.sMsg.buffer)
-                    if (TafMx.UriMapping[msg.iUri]) {
-                        let map = new (TafMx.UriMapping[msg.iUri])()
-                        map.readFrom(stream)
-                        this._emitter.emit(msg.iUri, map)
-                    }
-                    break
-                default:
-                    break
-            }
-        } catch (e) {
-            this.emit('error', e)
+      } else if (uri === 6501) {
+        // 礼物 SendItemSubBroadcastPacket
+        const s = new Taf.JceInputStream(ab)
+        const g = {}
+        g.readFrom = function (t) {
+          this.iItemType = t.readInt32(0, true, 0)
+          this.iItemCount = t.readInt32(2, true, 0)
+          this.lPresenterUid = t.readInt64(3, true, 0)
+          this.lSenderUid = t.readInt64(4, true, 0)
+          this.sSenderNick = t.readString(6, true, '')
         }
+        g.readFrom(s)
+        if (g.lPresenterUid !== this._yyuid) return
+        const info = this._gift_info[g.iItemType + ''] || { name: `礼物(${g.iItemType})`, price: 0 }
+        this.emit('message', {
+          type: 'gift',
+          time: Date.now(),
+          name: info.name,
+          from: { name: g.sSenderNick, rid: String(g.lSenderUid) },
+          id: md5(JSON.stringify(g)),
+          count: g.iItemCount,
+          price: g.iItemCount * info.price,
+          earn: g.iItemCount * info.price,
+        })
+      } else if (uri === 8006) {
+        // 人气 AttendeeCountNotice
+        const s = new Taf.JceInputStream(ab)
+        const on = {}
+        on.readFrom = function (t) { this.iAttendeeCount = t.readInt32(0, true, 0) }
+        on.readFrom(s)
+        this.emit('message', { type: 'online', time: Date.now(), count: on.iAttendeeCount })
+      }
+      // 其他 uri(系统/活动消息)忽略
+    } catch (e) { /* 单条消息失败不影响整体 */ }
+  }
 
-    }
+  // ---------- 断线重连(指数退避) ----------
+  _on_close() {
+    clearInterval(this._heartbeat_timer)
+    if (this._stopped) return
+    const delay = Math.min(1000 * Math.pow(2, this._retry++), 30000)
+    clearTimeout(this._reconnect_timer)
+    this._reconnect_timer = setTimeout(() => {
+      if (this._stopped) return
+      this._connect()
+    }, delay)
+    this.emit('close')
+  }
 
-    _send_wup(action, callback, req) {
-        try {
-            let wup = new Taf.Wup()
-            wup.setServant(action)
-            wup.setFunc(callback)
-            wup.writeStruct("tReq", req)
-            let command = new HUYA.WebSocketCommand()
-            command.iCmdType = HUYA.EWebSocketCommandType.EWSCmd_WupReq
-            command.vData = wup.encode()
-            let stream = new Taf.JceOutputStream()
-            command.writeTo(stream)
-            this._client.send(stream.getBuffer())
-        } catch (err) {
-            this.emit('error', err)
-        }
+  stop() {
+    this._stopped = true
+    clearInterval(this._heartbeat_timer)
+    clearTimeout(this._reconnect_timer)
+    this.removeAllListeners()
+    if (this._client) {
+      try { this._client.terminate() } catch (e) { /* ignore */ }
+      this._client = null
     }
-
-    _stop() {
-        this._starting = false
-        this._emitter.removeAllListeners()
-        clearInterval(this._heartbeat_timer)
-        clearInterval(this._fresh_gift_list_timer)
-        this._client && this._client.terminate()
-    }
-
-    stop() {
-        this.removeAllListeners()
-        this._stop()
-    }
+  }
 }
 
 module.exports = huya_danmu

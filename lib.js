@@ -774,7 +774,7 @@ Taf.DataHelp = {
             case Taf.DataHelp.EN_INT64:
                 return this.buf.readInt64()
         }
-        throw Error("read int64 type mismatch, tag:" + t + ", get type:" + h.type)
+        throw Error("read int64 type mismatch, tag:" + t + ", get type:" + r.type)
     }
     ,
     Taf.JceInputStream.prototype.readFloat = function (t, e, i) {
