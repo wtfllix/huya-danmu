@@ -1,10 +1,19 @@
-// huya-danmu v3 — 虎牙直播弹幕监听(新版协议)
-// 协议:ws://ws.api.huya.com → wsLaunch(WUP) → registerGroup(["live:<uid>","chat:<uid>"]) → 实时消息
-// 消息 URI:1400=弹幕 6501=礼物 8006=人气
-// 与原版 API 完全兼容:new huya_danmu(roomid), on('message'|'connect'|'error'|'close'), start()/stop()
+// huya-danmu v3 — 虎牙直播弹幕监听(双协议自适应)
+//
+// 默认协议(推荐):新协议 wsLaunch(WUP) → registerGroup(命令16)
+//   —— 只依赖 lUid,任何房间可用;弹幕/礼物/人气全功能
+// 可选协议:opt.protocol = 'legacy' 时用老协议 RegisterReq(命令1)
+//   —— 单包进组更轻量,但**收不到礼物消息**(服务器不推送 6501)
+//
+// 消息推送 —— 命令7(V1) / 命令22(V2),URI: 1400=弹幕 6501=礼物 8006=人气
+// 心跳     —— 命令20 → 回包21,每 60s
+//
+// 与原版 API 完全兼容:
+//   new huya_danmu(roomid | {roomid, proxy, protocol?})
+//   client.on('connect' | 'message' | 'error' | 'close')
+//   client.start() / client.stop()
 const ws = require('ws')
 const https = require('https')
-const http = require('http')
 const crypto = require('crypto')
 const events = require('events')
 const { Taf, HUYA } = require('./lib')
@@ -23,21 +32,27 @@ Taf.Wup.prototype.readFrom = function (t) {
   this.status = t.readMap(10, true, new Taf.Map(new Taf.STRING, new Taf.STRING))
 }
 
-// WebSocketCommand 类型(新版协议)
+// WebSocketCommand 类型
 const CMD = {
-  WupReq: 3,
+  RegisterReq: 1,          // 老协议:WSUserInfo 绑定
+  RegisterRsp: 2,
+  WupReq: 3,               // WUP 请求(wsLaunch / getPropsList)
   WupRsp: 4,
-  S2C_MsgPushReq: 7,
-  C2S_RegisterGroupReq: 16,
+  S2C_MsgPushReq: 7,       // 消息推送 V1
+  C2S_RegisterGroupReq: 16, // 新协议:注册弹幕组
   S2C_RegisterGroupRsp: 17,
-  C2S_HeartBeatReq: 20,
+  C2S_HeartBeatReq: 20,    // 心跳
   S2C_HeartBeatRsp: 21,
-  S2C_MsgPushReq_V2: 22,
+  S2C_MsgPushReq_V2: 22,   // 消息推送 V2
 }
 
-const WS_URL = 'ws://ws.api.huya.com'
+// 消息 URI
+const URI = { CHAT: 1400, GIFT: 6501, ONLINE: 8006 }
+
+const WS_URL = 'ws://ws.api.huya.com'       // 老协议端点(实时可用)
+const WSS_URL = 'wss://cdnws.api.huya.com'  // 备用端点
 const HEARTBEAT_INTERVAL = 60000
-const UA = 'Mozilla/5.0 (Linux; Android 5.1.1; Nexus 6 Build/LYZ28E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.84 Mobile Safari/537.36'
+const UA = 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Mobile Safari/537.36'
 
 function toAB(b) { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }
 function md5(s) { return crypto.createHash('md5').update(String(s)).digest('hex') }
@@ -50,18 +65,19 @@ class huya_danmu extends events {
     } else if (typeof opt === 'object') {
       this._roomid = opt.roomid
       if (opt.proxy) this._proxy = opt.proxy
+      if (opt.protocol === 'legacy') this._protocol = 'legacy'
     }
-    this._gift_info = {}
+    this._gift_info = {}      // 礼物 id → {name, price}
     this._starting = false
     this._stopped = false
-    this._retry = 0
+    this._retry = 0           // 重连退避计数
   }
 
-  // ---------- 页面请求 ----------
+  // ================= 页面信息 =================
+
   _fetch(url) {
     return new Promise((resolve, reject) => {
-      const mod = url.startsWith('https') ? https : http
-      const req = mod.get(url, { headers: { 'User-Agent': UA } }, res => {
+      const req = https.get(url, { headers: { 'User-Agent': UA } }, res => {
         let d = ''
         res.on('data', c => (d += c))
         res.on('end', () => resolve(d))
@@ -71,21 +87,32 @@ class huya_danmu extends events {
     })
   }
 
-  // 从新版页面 HNF_GLOBAL_INIT 提取主播 uid(不再需要 SUBSID/TOPSID)
-  async _get_uid() {
+  // 从新版页面提取房间信息:
+  //   lUid/lYyid —— 任何房间都有(主播身份)
+  //   lChannelId/lSubChannelId —— 仅开播房间有(直播流频道)
+  async _get_room_info() {
     const body = await this._fetch(`https://m.huya.com/${this._roomid}`)
-    const m = body.match(/"lUid"\s*:\s*(\d+)/)
-    if (!m) throw new Error('无法从页面获取 lUid,房间可能不存在')
-    return parseInt(m[1])
+    const find = kw => {
+      const m = body.match(new RegExp('"' + kw + '"\\s*:\\s*(\\d+)'))
+      return m ? parseInt(m[1]) : 0
+    }
+    const info = {
+      lUid: find('lUid') || find('lYyid'),
+      lChannelId: find('lChannelId'),
+      lSubChannelId: find('lSubChannelId'),
+    }
+    if (!info.lUid) throw new Error('无法从页面获取主播 uid,房间可能不存在')
+    return info
   }
 
-  // ---------- 生命周期 ----------
+  // ================= 生命周期 =================
+
   async start() {
     if (this._starting) return
     this._starting = true
     this._stopped = false
     try {
-      this._yyuid = await this._get_uid()
+      this._info = await this._get_room_info()
     } catch (e) {
       this._starting = false
       this.emit('error', e)
@@ -111,22 +138,51 @@ class huya_danmu extends events {
 
   _on_open() {
     this._retry = 0
+    // 协议选择:默认新协议(全功能);legacy 需房间在播(有 lChannelId)
+    if (this._protocol === 'legacy' && this._info.lChannelId && this._info.lSubChannelId) {
+      this._handshake_mode = 'legacy'
+      this._handshake_legacy()
+    } else {
+      this._handshake_mode = 'new'
+      this._handshake_new()
+    }
     this.emit('connect')
-    // 1) wsLaunch
+    clearInterval(this._heartbeat_timer)
+    this._heartbeat_timer = setInterval(() => this._heartbeat(), HEARTBEAT_INTERVAL)
+  }
+
+  // ================= 握手:老协议(RegisterReq) =================
+  // 单包绑定 WSUserInfo,real-url 等长期使用的方案,最轻量
+  // 注意:此模式收不到礼物消息(6501),仅弹幕+人气
+  _handshake_legacy() {
+    const info = new HUYA.WSUserInfo()
+    info.lUid = this._info.lUid
+    info.bAnonymous = true
+    info.sGuid = ''
+    info.sToken = ''
+    info.lTid = this._info.lChannelId
+    info.lSid = this._info.lSubChannelId
+    info.lGroupId = 0
+    info.lGroupType = 0
+    const j = new Taf.JceOutputStream()
+    info.writeTo(j)
+    this._send_ws_cmd(CMD.RegisterReq, j.getBinBuffer())
+  }
+
+  // ================= 握手:新协议(wsLaunch + registerGroup) =================
+  // 官方 web 客户端当前方案,只依赖 lUid,未开播房间也能注册
+  _handshake_new() {
     const wup = new Taf.Wup()
     wup.setServant('launch')
     wup.setFunc('wsLaunch')
     wup.setRequestId(1)
     wup.writeStruct('tReq', this._make_launch_req())
     this._send_ws_cmd(CMD.WupReq, wup.encode())
-    // 心跳
-    clearInterval(this._heartbeat_timer)
-    this._heartbeat_timer = setInterval(() => this._heartbeat(), HEARTBEAT_INTERVAL)
   }
 
   _make_launch_req() {
     const r = {}
-    r.lUid = this._yyuid
+    r.lUid = this._info.lUid
     r.sGuid = ''
     r.sUA = 'webh5&1.0.0&websocket'
     r.sAppSrc = ''
@@ -142,10 +198,9 @@ class huya_danmu extends events {
     return r
   }
 
-  // 2) 注册弹幕组
   _register_group() {
     const g = {}
-    g.vGroupId = [`live:${this._yyuid}`, `chat:${this._yyuid}`]
+    g.vGroupId = [`live:${this._info.lUid}`, `chat:${this._info.lUid}`]
     g.sToken = ''
     g.writeTo = function (t) {
       t.writeTo(0, Taf.DataHelp.EN_LIST)
@@ -158,22 +213,14 @@ class huya_danmu extends events {
     this._send_ws_cmd(CMD.C2S_RegisterGroupReq, s.getBinBuffer())
   }
 
-  // 3) 拉取礼物名称表
-  _get_gift_list() {
-    const req = new HUYA.GetPropsListReq()
-    const uid = new HUYA.UserId()
-    uid.lUid = this._yyuid
-    uid.sHuYaUA = 'webh5&1.0.0&websocket'
-    req.tUserId = uid
-    req.iTemplateType = HUYA.EClientTemplateType.TPL_WEB
-    this._send_wup('PropsUIServer', 'getPropsList', req, 3)
-  }
+  // ================= 心跳 =================
 
   _heartbeat() {
     this._send_ws_cmd(CMD.C2S_HeartBeatReq, null)
   }
 
-  // ---------- 发送 ----------
+  // ================= 发送 =================
+
   _send_ws_cmd(cmdType, vData) {
     if (!this._client || this._client.readyState !== ws.OPEN) return
     const cmd = new HUYA.WebSocketCommand()
@@ -193,7 +240,8 @@ class huya_danmu extends events {
     this._send_ws_cmd(CMD.WupReq, wup.encode())
   }
 
-  // ---------- 接收 ----------
+  // ================= 接收 =================
+
   _on_message(data) {
     try {
       const cmd = new HUYA.WebSocketCommand()
@@ -205,14 +253,13 @@ class huya_danmu extends events {
         case CMD.S2C_RegisterGroupRsp:
           this._get_gift_list()
           break
-        case CMD.S2C_HeartBeatRsp:
-          break
         case CMD.S2C_MsgPushReq:
           this._on_push_v1(cmd)
           break
         case CMD.S2C_MsgPushReq_V2:
           this._on_push_v2(cmd)
           break
+        // RegisterRsp / HeartBeatRsp:无需处理
         default:
           break
       }
@@ -225,16 +272,31 @@ class huya_danmu extends events {
     const wup = new Taf.Wup()
     wup.decode(cmd.vData.buffer)
     if (wup.sFuncName === 'wsLaunch') {
+      // 新协议:wsLaunch 成功后注册弹幕组
       this._register_group()
     } else if (wup.sFuncName === 'getPropsList') {
-      try {
-        const rsp = new HUYA.GetPropsListRsp()
-        new Taf.JceInputStream(wup.newdata.get('tRsp').buffer).readStruct(0, true, rsp)
-        rsp.vPropsItemList.value.forEach(item => {
-          this._gift_info[item.iPropsId + ''] = { name: item.sPropsName, price: item.iPropsYb / 100 }
-        })
-      } catch (e) { /* 礼物表失败不影响主流程 */ }
+      this._parse_gift_list(wup)
     }
+  }
+
+  _parse_gift_list(wup) {
+    try {
+      const rsp = new HUYA.GetPropsListRsp()
+      new Taf.JceInputStream(wup.newdata.get('tRsp').buffer).readStruct(0, true, rsp)
+      rsp.vPropsItemList.value.forEach(item => {
+        this._gift_info[item.iPropsId + ''] = { name: item.sPropsName, price: item.iPropsYb / 100 }
+      })
+    } catch (e) { /* 礼物表失败不影响主流程 */ }
+  }
+
+  _get_gift_list() {
+    const req = new HUYA.GetPropsListReq()
+    const uid = new HUYA.UserId()
+    uid.lUid = this._info.lUid
+    uid.sHuYaUA = 'webh5&1.0.0&websocket'
+    req.tUserId = uid
+    req.iTemplateType = HUYA.EClientTemplateType.TPL_WEB
+    this._send_wup('PropsUIServer', 'getPropsList', req, 3)
   }
 
   _on_push_v1(cmd) {
@@ -248,6 +310,7 @@ class huya_danmu extends events {
   }
 
   _on_push_v2(cmd) {
+    // V2:sGroupId(0) + vMsgItem(1)[ {iUri int64, sMsg} ]
     const v2 = {}
     v2.readFrom = function (t) {
       this.sGroupId = t.readString(0, true, '')
@@ -272,15 +335,13 @@ class huya_danmu extends events {
     v2.readFrom(new Taf.JceInputStream(cmd.vData.buffer))
     for (const item of v2.vMsgItem) {
       if (!item.sMsg) continue
-      try {
-        this._handle_uri(item.iUri, item.sMsg.buffer)
-      } catch (e) { /* 单条 item 失败跳过 */ }
+      try { this._handle_uri(item.iUri, item.sMsg.buffer) } catch (e) { /* 单条失败跳过 */ }
     }
   }
 
   _handle_uri(uri, ab) {
     try {
-      if (uri === 1400) {
+      if (uri === URI.CHAT) {
         // 弹幕 MessageNotice: tUserInfo(0) lTid(1) sContent(3)
         const s = new Taf.JceInputStream(ab)
         const chat = {}
@@ -291,6 +352,8 @@ class huya_danmu extends events {
             this.sNickName = tt.readString(2, true, '')
           }
           this.tUserInfo = t.readStruct(0, true, u)
+          this.lTid = t.readInt64(1, true, 0)
+          this.lSid = t.readInt64(2, true, 0)
           this.sContent = t.readString(3, true, '')
         }
         chat.readFrom(s)
@@ -301,7 +364,7 @@ class huya_danmu extends events {
           id: md5(JSON.stringify(chat)),
           content: chat.sContent,
         })
-      } else if (uri === 6501) {
+      } else if (uri === URI.GIFT) {
         // 礼物 SendItemSubBroadcastPacket
         const s = new Taf.JceInputStream(ab)
         const g = {}
@@ -313,7 +376,7 @@ class huya_danmu extends events {
           this.sSenderNick = t.readString(6, true, '')
         }
         g.readFrom(s)
-        if (g.lPresenterUid !== this._yyuid) return
+        if (g.lPresenterUid !== this._info.lUid) return
         const info = this._gift_info[g.iItemType + ''] || { name: `礼物(${g.iItemType})`, price: 0 }
         this.emit('message', {
           type: 'gift',
@@ -325,7 +388,7 @@ class huya_danmu extends events {
           price: g.iItemCount * info.price,
           earn: g.iItemCount * info.price,
         })
-      } else if (uri === 8006) {
+      } else if (uri === URI.ONLINE) {
         // 人气 AttendeeCountNotice
         const s = new Taf.JceInputStream(ab)
         const on = {}
@@ -337,7 +400,8 @@ class huya_danmu extends events {
     } catch (e) { /* 单条消息失败不影响整体 */ }
   }
 
-  // ---------- 断线重连(指数退避) ----------
+  // ================= 断线重连(指数退避) =================
+
   _on_close() {
     clearInterval(this._heartbeat_timer)
     if (this._stopped) return

@@ -1,10 +1,9 @@
 # huya-danmu
 
-Node.js 虎牙直播弹幕监听模块(适配虎牙新版协议)。
+Node.js 虎牙直播弹幕监听模块(适配虎牙新版页面与协议)。
 
-> ⚠️ **v3 说明**:虎牙页面在 2021 年前后改版,旧版抓取 `SUBSID/TOPSID` 的方式已失效。本版本重写了协议层:
-> 从新版页面 `HNF_GLOBAL_INIT` 提取主播 uid → WebSocket `wsLaunch` → 注册弹幕组 `live:<uid>` / `chat:<uid>` → 实时接收消息。
-> API 与旧版完全兼容。
+> **v3 说明**:虎牙页面改版后,旧版抓取 `SUBSID/TOPSID` 的方式已失效。v3 重写了协议层:
+> 从新版页面提取主播 uid,通过 WebSocket 实时接收弹幕/礼物/人气,API 与旧版完全兼容。
 
 ## 安装
 
@@ -66,6 +65,14 @@ const huya_danmu = require('huya-danmu')
 const roomid = '1995'
 const proxy = 'socks://name:pass@127.0.0.1:1080'
 const client = new huya_danmu({ roomid, proxy })
+client.start()
+```
+
+### 使用老协议模式(可选)
+
+```javascript
+// 老协议(RegisterReq 单包绑定)更轻量,但收不到礼物消息(服务器不推送)
+const client = new huya_danmu({ roomid, protocol: 'legacy' })
 client.start()
 ```
 
@@ -134,18 +141,29 @@ msg 对象 type 有 `chat`、`gift`、`online` 三种值。
 
 ## 协议说明(v3)
 
-1. 请求 `https://m.huya.com/<roomid>` 页面,从 `HNF_GLOBAL_INIT` JSON 提取主播 `lUid`
+### 默认协议:wsLaunch + registerGroup(新协议)
+
+1. 请求 `https://m.huya.com/<roomid>`,从 `HNF_GLOBAL_INIT` JSON 提取主播 `lUid`(任何房间都有)
 2. 连接 `ws://ws.api.huya.com`
 3. 发送 `wsLaunch` WUP 请求(命令类型 3)
 4. 注册弹幕组 `live:<uid>`、`chat:<uid>`(命令类型 16)
-5. 每 60s 发送心跳(命令类型 20)
+5. 每 60s 发送心跳(命令类型 20,回包 21)
 6. 实时接收推送(命令类型 7/22),URI:1400=弹幕、6501=礼物、8006=人气
+7. 礼物名称通过 `PropsUIServer/getPropsList` 拉取
+
+**优点**:只依赖 `lUid`,未开播房间也能连接(开播后自动开始收弹幕);弹幕/礼物/人气全功能。
+
+### 可选协议:RegisterReq(老协议)
+
+- `opt.protocol: 'legacy'` 启用
+- 单包 `WSUserInfo` 绑定(命令类型 1),需要页面 `lChannelId`/`lSubChannelId`(仅开播房间有)
+- 更轻量,但**收不到礼物消息**
 
 ## 依赖
 
 - [ws](https://www.npmjs.com/package/ws)
 - [socks-proxy-agent](https://www.npmjs.com/package/socks-proxy-agent)
-- `lib.js` 为虎牙 Taf/JCE 协议编解码库(源自本项目旧版,协议格式未变)
+- `lib.js` 为虎牙 Taf/JCE 协议编解码库(源自本项目旧版,协议格式未变;修复了 `skipField` 对 int64 等类型不支持的问题)
 
 ## License
 
