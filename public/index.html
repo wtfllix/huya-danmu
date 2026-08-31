@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>虎牙弹幕观察台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">HUYA DANMU OBSERVATORY</p>
+      <h1>虎牙弹幕观察台</h1>
+    </div>
+    <div class="header-actions">
+      <span id="clock" class="muted"></span>
+      <button id="tokenButton" class="button ghost">访问令牌</button>
+      <span id="healthBadge" class="badge unknown">连接中</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero-grid">
+      <article class="panel room-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">COLLECTOR</p><h2>监听状态</h2></div>
+          <button id="refreshButton" class="icon-button" title="刷新">↻</button>
+        </div>
+        <div id="roomEmpty" class="empty-state">
+          <p>尚未添加主播</p>
+          <form id="roomForm">
+            <input id="roomIdInput" placeholder="虎牙房间号或短码" autocomplete="off" required>
+            <button class="button primary" type="submit">开始管理</button>
+          </form>
+        </div>
+        <div id="roomCard" class="room-card hidden">
+          <div>
+            <span id="roomStatus" class="status-dot"></span>
+            <strong id="anchorName">—</strong>
+            <span id="externalRoomId" class="muted"></span>
+          </div>
+          <dl class="facts">
+            <div><dt>运行状态</dt><dd id="runtimeStatus">—</dd></div>
+            <div><dt>最近检测</dt><dd id="lastChecked">—</dd></div>
+            <div><dt>最近弹幕</dt><dd id="lastMessage">—</dd></div>
+            <div><dt>主播 UID</dt><dd id="anchorUid">—</dd></div>
+          </dl>
+          <p id="roomError" class="room-error hidden"></p>
+          <button id="toggleRoomButton" class="button ghost">暂停监听</button>
+        </div>
+      </article>
+
+      <article class="panel storage-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">STORAGE</p><h2>存储健康</h2></div>
+          <div class="button-row">
+            <button id="sampleButton" class="button ghost">重新采样</button>
+            <button id="archiveButton" class="button ghost">执行归档</button>
+          </div>
+        </div>
+        <div id="storageCards" class="storage-grid"></div>
+      </article>
+    </section>
+
+    <section class="panel analytics-panel">
+      <div class="panel-heading analytics-heading">
+        <div><p class="eyebrow">ANALYTICS</p><h2>弹幕趋势</h2></div>
+        <div class="filters">
+          <input id="analysisDate" type="date">
+          <select id="intervalSelect">
+            <option value="1m">每分钟</option>
+            <option value="5m">每 5 分钟</option>
+            <option value="15m" selected>每 15 分钟</option>
+            <option value="1h">每小时</option>
+          </select>
+          <button id="analyzeButton" class="button primary">分析</button>
+        </div>
+      </div>
+      <div class="chart-summary">
+        <div><span>当日弹幕</span><strong id="dailyTotal">0</strong></div>
+        <div><span>峰值时段</span><strong id="peakBucket">—</strong></div>
+        <div><span>峰值数量</span><strong id="peakCount">0</strong></div>
+      </div>
+      <div class="chart-wrap"><canvas id="messageChart"></canvas></div>
+    </section>
+
+    <section class="content-grid">
+      <article class="panel">
+        <div class="panel-heading"><div><p class="eyebrow">DAILY TOP 10</p><h2>高频弹幕</h2></div></div>
+        <ol id="topMessages" class="ranking"><li class="empty-row">暂无数据</li></ol>
+      </article>
+      <article class="panel">
+        <div class="panel-heading"><div><p class="eyebrow">LIVE FEED</p><h2>最近弹幕</h2></div><button id="exportButton" class="button ghost">导出当日 CSV</button></div>
+        <div id="recentMessages" class="message-feed"><p class="empty-row">暂无数据</p></div>
+      </article>
+    </section>
+
+    <section class="panel archive-panel">
+      <div class="panel-heading"><div><p class="eyebrow">ARCHIVE LOG</p><h2>最近归档</h2></div></div>
+      <div class="table-wrap">
+        <table><thead><tr><th>时间范围</th><th>状态</th><th>记录数</th><th>文件大小</th><th>备份</th></tr></thead><tbody id="archiveRows"></tbody></table>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

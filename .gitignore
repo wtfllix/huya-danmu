@@ -1,3 +1,7 @@
 node_modules/
 .DS_Store
 .npmignore
+.env
+data/*
+!data/.gitkeep
+backup/

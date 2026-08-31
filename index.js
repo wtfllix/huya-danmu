@@ -15,7 +15,7 @@
 const ws = require('ws')
 const https = require('https')
 const crypto = require('crypto')
-const events = require('events')
+const { EventEmitter } = require('events')
 const { Taf, HUYA } = require('./lib')
 
 // ---- Taf.Wup.readFrom 补丁:新版响应带 context/status map,需要默认 Map 类 ----
@@ -49,24 +49,28 @@ const CMD = {
 // 消息 URI
 const URI = { CHAT: 1400, GIFT: 6501, ONLINE: 8006 }
 
-const WS_URL = 'ws://ws.api.huya.com'       // 老协议端点(实时可用)
-const WSS_URL = 'wss://cdnws.api.huya.com'  // 备用端点
+const WS_URL = 'ws://ws.api.huya.com'
+const WSS_URL = 'wss://cdnws.api.huya.com'
 const HEARTBEAT_INTERVAL = 60000
+const HANDSHAKE_TIMEOUT = 15000
 const UA = 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Mobile Safari/537.36'
 
 function toAB(b) { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }
 function md5(s) { return crypto.createHash('md5').update(String(s)).digest('hex') }
 
-class huya_danmu extends events {
+class huya_danmu extends EventEmitter {
   constructor(opt) {
     super()
-    if (typeof opt === 'string') {
-      this._roomid = opt
-    } else if (typeof opt === 'object') {
-      this._roomid = opt.roomid
+    if (typeof opt === 'string' || typeof opt === 'number') {
+      this._roomid = String(opt)
+    } else if (opt && typeof opt === 'object' && !Array.isArray(opt)) {
+      this._roomid = String(opt.roomid || '')
       if (opt.proxy) this._proxy = opt.proxy
       if (opt.protocol === 'legacy') this._protocol = 'legacy'
+      if (opt.wsUrl) this._ws_url = opt.wsUrl
     }
+    if (!this._roomid) throw new TypeError('roomid 必须是非空字符串或数字')
+    this._ws_url = this._ws_url || WSS_URL
     this._gift_info = {}      // 礼物 id → {name, price}
     this._starting = false
     this._stopped = false
@@ -78,8 +82,16 @@ class huya_danmu extends events {
   _fetch(url) {
     return new Promise((resolve, reject) => {
       const req = https.get(url, { headers: { 'User-Agent': UA } }, res => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          res.resume()
+          reject(new Error(`虎牙页面请求失败: HTTP ${res.statusCode}`))
+          return
+        }
         let d = ''
-        res.on('data', c => (d += c))
+        res.on('data', c => {
+          d += c
+          if (d.length > 5 * 1024 * 1024) req.destroy(new Error('虎牙页面响应超过 5 MB'))
+        })
         res.on('end', () => resolve(d))
       })
       req.on('error', reject)
@@ -108,7 +120,7 @@ class huya_danmu extends events {
   // ================= 生命周期 =================
 
   async start() {
-    if (this._starting) return
+    if (this._starting || (this._client && this._client.readyState < ws.CLOSING)) return
     this._starting = true
     this._stopped = false
     try {
@@ -123,12 +135,13 @@ class huya_danmu extends events {
   }
 
   _connect() {
+    this._starting = true
     const opt = { perMessageDeflate: false }
     if (this._proxy) {
       const { SocksProxyAgent } = require('socks-proxy-agent')
       opt.agent = new SocksProxyAgent(this._proxy)
     }
-    const client = new ws(WS_URL, opt)
+    const client = new ws(this._ws_url, opt)
     this._client = client
     client.on('open', () => this._on_open())
     client.on('message', data => this._on_message(data))
@@ -137,7 +150,6 @@ class huya_danmu extends events {
   }
 
   _on_open() {
-    this._retry = 0
     // 协议选择:默认新协议(全功能);legacy 需房间在播(有 lChannelId)
     if (this._protocol === 'legacy' && this._info.lChannelId && this._info.lSubChannelId) {
       this._handshake_mode = 'legacy'
@@ -147,6 +159,13 @@ class huya_danmu extends events {
       this._handshake_new()
     }
     this.emit('connect')
+    clearTimeout(this._handshake_timer)
+    this._handshake_timer = setTimeout(() => {
+      const error = new Error('虎牙协议握手超时')
+      error.code = 'HUYA_HANDSHAKE_TIMEOUT'
+      this.emit('error', error)
+      if (this._client) this._client.terminate()
+    }, HANDSHAKE_TIMEOUT)
     clearInterval(this._heartbeat_timer)
     this._heartbeat_timer = setInterval(() => this._heartbeat(), HEARTBEAT_INTERVAL)
   }
@@ -247,10 +266,14 @@ class huya_danmu extends events {
       const cmd = new HUYA.WebSocketCommand()
       cmd.readFrom(new Taf.JceInputStream(toAB(Buffer.from(data))))
       switch (cmd.iCmdType) {
+        case CMD.RegisterRsp:
+          this._on_ready()
+          break
         case CMD.WupRsp:
           this._on_wup_rsp(cmd)
           break
         case CMD.S2C_RegisterGroupRsp:
+          this._on_ready()
           this._get_gift_list()
           break
         case CMD.S2C_MsgPushReq:
@@ -266,6 +289,14 @@ class huya_danmu extends events {
     } catch (e) {
       this.emit('error', e)
     }
+  }
+
+  _on_ready() {
+    if (!this._starting) return
+    clearTimeout(this._handshake_timer)
+    this._starting = false
+    this._retry = 0
+    this.emit('ready')
   }
 
   _on_wup_rsp(cmd) {
@@ -286,7 +317,7 @@ class huya_danmu extends events {
       rsp.vPropsItemList.value.forEach(item => {
         this._gift_info[item.iPropsId + ''] = { name: item.sPropsName, price: item.iPropsYb / 100 }
       })
-    } catch (e) { /* 礼物表失败不影响主流程 */ }
+    } catch (e) { this.emit('parseError', { uri: 'getPropsList', error: e }) }
   }
 
   _get_gift_list() {
@@ -325,17 +356,21 @@ class huya_danmu extends events {
             this.sMsg = tt.readBytes(1, true, null)
           }
           try {
-            item.readFrom(t)
+            t.readStruct(0, true, item)
             items.push(item)
-          } catch (e) { break /* 解析失败中断,避免流错位 */ }
+          } catch (e) {
+            this.emitParseError = e
+            break
+          }
         }
       }
       this.vMsgItem = items
     }
     v2.readFrom(new Taf.JceInputStream(cmd.vData.buffer))
+    if (v2.emitParseError) this.emit('parseError', { uri: 'push-v2', error: v2.emitParseError })
     for (const item of v2.vMsgItem) {
       if (!item.sMsg) continue
-      try { this._handle_uri(item.iUri, item.sMsg.buffer) } catch (e) { /* 单条失败跳过 */ }
+      this._handle_uri(item.iUri, item.sMsg.buffer)
     }
   }
 
@@ -397,13 +432,15 @@ class huya_danmu extends events {
         this.emit('message', { type: 'online', time: Date.now(), count: on.iAttendeeCount })
       }
       // 其他 uri(系统/活动消息)忽略
-    } catch (e) { /* 单条消息失败不影响整体 */ }
+    } catch (e) { this.emit('parseError', { uri, error: e }) }
   }
 
   // ================= 断线重连(指数退避) =================
 
   _on_close() {
     clearInterval(this._heartbeat_timer)
+    clearTimeout(this._handshake_timer)
+    this._starting = false
     if (this._stopped) return
     const delay = Math.min(1000 * Math.pow(2, this._retry++), 30000)
     clearTimeout(this._reconnect_timer)
@@ -416,14 +453,19 @@ class huya_danmu extends events {
 
   stop() {
     this._stopped = true
+    this._starting = false
     clearInterval(this._heartbeat_timer)
     clearTimeout(this._reconnect_timer)
-    this.removeAllListeners()
+    clearTimeout(this._handshake_timer)
     if (this._client) {
-      try { this._client.terminate() } catch (e) { /* ignore */ }
+      const client = this._client
       this._client = null
+      client.removeAllListeners()
+      try { client.terminate() } catch (e) { /* ignore */ }
     }
   }
 }
 
 module.exports = huya_danmu
+module.exports.WS_URL = WS_URL
+module.exports.WSS_URL = WSS_URL

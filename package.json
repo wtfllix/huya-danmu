@@ -1,10 +1,17 @@
 {
   "name": "huya-danmu",
   "version": "3.1.0",
-  "description": "虎牙直播弹幕监听模块(新版协议)",
+  "description": "虎牙直播弹幕长期监听与分析平台",
   "main": "index.js",
   "scripts": {
-    "test": "node test.js"
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "test:live": "node examples/live-listener.js",
+    "check": "node --check index.js && find src test public -name '*.js' -print0 | xargs -0 -n1 node --check"
+  },
+  "engines": {
+    "node": ">=22.0.0"
   },
   "keywords": [
     "huya",
@@ -16,6 +23,11 @@
   "author": "BacooTang <huya-danmu@users.noreply.github.com>",
   "license": "MIT",
   "dependencies": {
+    "@fastify/static": "^10.1.3",
+    "fastify": "^5.12.1",
+    "parquetjs-lite": "^0.8.7",
+    "pg": "^8.23.0",
+    "pg-query-stream": "^4.17.0",
     "socks-proxy-agent": "^8.0.5",
     "ws": "^8.18.0"
   }

@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: huya_danmu
+      POSTGRES_USER: huya
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_INITDB_ARGS: --allow-group-access
+      TZ: Asia/Shanghai
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U huya -d huya_danmu"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://huya:${POSTGRES_PASSWORD:-change-me}@postgres:5432/huya_danmu
+      HUYA_ROOM_ID: ${HUYA_ROOM_ID:-}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      DATABASE_STORAGE_PATH: /postgres-data
+      DATA_DIR: /app/data
+      BACKUP_PATH: /backup
+      TZ: Asia/Shanghai
+    ports:
+      - "${PORT:-3000}:3000"
+    group_add:
+      - "70"
+    volumes:
+      - app-data:/app/data
+      - backup-data:/backup
+      - postgres-data:/postgres-data:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres-data:
+  app-data:
+  backup-data:
