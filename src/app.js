@@ -63,7 +63,13 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
     reply.type('text/plain; version=0.0.4').send(`${lines.join('\n')}\n`)
   })
 
-  app.get('/api/v1/rooms', async () => database.listRooms())
+  app.get('/api/v1/rooms', async () => {
+    const rooms = await database.listRooms()
+    return rooms.map(room => ({
+      ...room,
+      is_default: Boolean(config.initialRoomId) && room.external_room_id === String(config.initialRoomId)
+    }))
+  })
 
   app.post('/api/v1/rooms', async (request, reply) => {
     const externalRoomId = String(request.body?.roomId || '').trim()

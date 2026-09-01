@@ -1,4 +1,4 @@
-const state = { rooms: [], room: null, counts: [], token: localStorage.getItem('huya_api_token') || '' }
+const state = { rooms: [], room: null, defaultRoomId: null, counts: [], token: localStorage.getItem('huya_api_token') || '' }
 const $ = selector => document.querySelector(selector)
 
 async function api(url, options = {}) {
@@ -49,8 +49,24 @@ async function loadHealth() {
 }
 
 async function loadRooms() {
+  const currentRoomId = state.room?.id
   state.rooms = await api('/api/v1/rooms')
-  state.room = state.rooms[0] || null
+  const defaultRoom = state.rooms.find(room => room.is_default) || null
+  const defaultChanged = defaultRoom && defaultRoom.id !== state.defaultRoomId
+  state.room = (defaultChanged ? defaultRoom : state.rooms.find(room => room.id === currentRoomId)) || defaultRoom || state.rooms[0] || null
+  state.defaultRoomId = defaultRoom?.id || null
+
+  const roomSelect = $('#roomSelect')
+  roomSelect.replaceChildren()
+  for (const room of state.rooms) {
+    const option = document.createElement('option')
+    option.value = room.id
+    option.textContent = `${room.anchor_name || '未知主播'} · ${room.external_room_id}${room.is_default ? '（默认）' : ''}`
+    roomSelect.append(option)
+  }
+  roomSelect.classList.toggle('hidden', state.rooms.length < 2)
+  if (state.room) roomSelect.value = state.room.id
+
   $('#roomEmpty').classList.toggle('hidden', Boolean(state.room))
   $('#roomCard').classList.toggle('hidden', !state.room)
   if (!state.room) return
@@ -221,6 +237,13 @@ $('#exportButton').addEventListener('click', async () => {
   } catch (error) { toast(error.message) }
 })
 $('#refreshButton').addEventListener('click', refresh)
+$('#roomSelect').addEventListener('change', async event => {
+  state.room = state.rooms.find(room => room.id === event.target.value) || null
+  try {
+    await loadRooms()
+    await Promise.all([loadAnalytics(), loadMessages()])
+  } catch (error) { toast(error.message) }
+})
 $('#analyzeButton').addEventListener('click', () => loadAnalytics().catch(error => toast(error.message)))
 $('#tokenButton').addEventListener('click', () => { const value = prompt('管理员 API Token', state.token); if (value !== null) { state.token = value.trim(); localStorage.setItem('huya_api_token', state.token); refresh() } })
 window.addEventListener('resize', () => {

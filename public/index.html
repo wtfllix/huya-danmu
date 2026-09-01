@@ -24,7 +24,10 @@
       <article class="panel room-panel">
         <div class="panel-heading">
           <div><p class="eyebrow">COLLECTOR</p><h2>监听状态</h2></div>
-          <button id="refreshButton" class="icon-button" title="刷新">↻</button>
+          <div class="button-row">
+            <select id="roomSelect" class="room-select hidden" aria-label="选择直播间"></select>
+            <button id="refreshButton" class="icon-button" title="刷新">↻</button>
+          </div>
         </div>
         <div id="roomEmpty" class="empty-state">
           <p>尚未添加主播</p>

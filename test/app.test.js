@@ -38,3 +38,21 @@ test('分析 API 拒绝无效区间', async t => {
   const response = await app.inject('/api/v1/analytics/message-counts?room_id=x&from=no&to=no')
   assert.equal(response.statusCode, 400)
 })
+
+test('房间列表标记 HUYA_ROOM_ID 对应的默认房间', async t => {
+  const deps = fixtures()
+  deps.config.initialRoomId = '2000'
+  deps.database.listRooms = async () => [
+    { id: 'old', external_room_id: '1000' },
+    { id: 'current', external_room_id: '2000' }
+  ]
+  const app = buildApp(deps)
+  t.after(() => app.close())
+
+  const response = await app.inject('/api/v1/rooms')
+  assert.equal(response.statusCode, 200)
+  assert.deepEqual(response.json(), [
+    { id: 'old', external_room_id: '1000', is_default: false },
+    { id: 'current', external_room_id: '2000', is_default: true }
+  ])
+})

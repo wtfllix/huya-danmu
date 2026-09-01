@@ -16,7 +16,7 @@
 - 归档有独立备份且校验通过后，才会删除对应 PostgreSQL 月分区。
 - Docker Compose 部署、健康检查、Prometheus 文本指标。
 
-完整产品和技术定义见 [docs/SPEC.md](docs/SPEC.md)。
+完整产品和技术定义见 [docs/SPEC.md](docs/SPEC.md)，与主播主题网站的后续集成路线见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 快速启动
 
