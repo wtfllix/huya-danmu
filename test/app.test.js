@@ -10,7 +10,8 @@ function fixtures() {
     getRoom: async () => null,
     listArchiveRuns: async () => [],
     messageCounts: async () => [],
-    topMessages: async () => []
+    topMessages: async () => [],
+    realtimeTopMessages: async () => []
   }
   const config = { logLevel: 'silent', apiToken: '', hotRetentionMonths: 12 }
   return {
@@ -55,4 +56,43 @@ test('房间列表标记 HUYA_ROOM_ID 对应的默认房间', async t => {
     { id: 'old', external_room_id: '1000', is_default: false },
     { id: 'current', external_room_id: '2000', is_default: true }
   ])
+})
+
+test('实时 Top API 使用同一截止时间返回多个窗口并缓存默认查询', async t => {
+  const deps = fixtures()
+  deps.database.getRoom = async id => id === 'room-1' ? { id } : null
+  let calls = 0
+  deps.database.realtimeTopMessages = async ({ roomId, windows, at, limit }) => {
+    calls += 1
+    assert.equal(roomId, 'room-1')
+    assert.deepEqual(windows, ['1m', '5m', '10m'])
+    assert.equal(limit, 10)
+    assert.ok(at instanceof Date)
+    return windows.map(window => ({
+      window, from: at.toISOString(), to: at.toISOString(), total_messages: '0', data_complete: null, items: []
+    }))
+  }
+  const app = buildApp(deps)
+  t.after(() => app.close())
+
+  const url = '/api/v1/analytics/realtime-top-messages?room_id=room-1'
+  const first = await app.inject(url)
+  const second = await app.inject(url)
+  assert.equal(first.statusCode, 200)
+  assert.equal(second.statusCode, 200)
+  assert.equal(calls, 1)
+  assert.equal(first.json().as_of, second.json().as_of)
+  assert.deepEqual(first.json().windows.map(item => item.window), ['1m', '5m', '10m'])
+})
+
+test('实时 Top API 校验窗口、limit、时区和房间', async t => {
+  const deps = fixtures()
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const base = '/api/v1/analytics/realtime-top-messages?room_id=missing'
+
+  assert.equal((await app.inject(`${base}&windows=2m`)).statusCode, 400)
+  assert.equal((await app.inject(`${base}&limit=51`)).statusCode, 400)
+  assert.equal((await app.inject(`${base}&at=2026-09-01T20:15:30`)).statusCode, 400)
+  assert.equal((await app.inject(base)).statusCode, 404)
 })

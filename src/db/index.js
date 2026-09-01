@@ -385,6 +385,81 @@ class Database {
     return historical.rows
   }
 
+  async realtimeTopMessages({ roomId, windows, at, limit = 10 }) {
+    const durationSeconds = { '1m': 60, '5m': 300, '10m': 600 }
+    const durations = windows.map(window => durationSeconds[window])
+    const maxDuration = Math.max(...durations)
+    const { rows } = await this.query(
+      `WITH window_defs AS (
+         SELECT requested.window, requested.duration_seconds, requested.ordinal,
+                $4::timestamptz - make_interval(secs => requested.duration_seconds) AS from_at
+         FROM unnest($2::text[], $3::integer[]) WITH ORDINALITY
+              AS requested(window, duration_seconds, ordinal)
+       ), candidate_messages AS MATERIALIZED (
+         SELECT ingest_id, occurred_at, content_normalized
+         FROM danmu_messages
+         WHERE room_id = $1
+           AND occurred_at >= $4::timestamptz - make_interval(secs => $5)
+           AND occurred_at < $4::timestamptz
+       ), window_totals AS (
+         SELECT w.window, w.ordinal, w.from_at, count(m.ingest_id)::bigint AS total_messages
+         FROM window_defs w
+         LEFT JOIN candidate_messages m ON m.occurred_at >= w.from_at
+         GROUP BY w.window, w.ordinal, w.from_at
+       ), content_counts AS (
+         SELECT w.window, m.content_normalized AS content, count(*)::bigint AS message_count
+         FROM window_defs w
+         JOIN candidate_messages m ON m.occurred_at >= w.from_at
+         WHERE m.content_normalized <> ''
+         GROUP BY w.window, m.content_normalized
+       ), ranked AS (
+         SELECT window, content, message_count,
+                row_number() OVER (
+                  PARTITION BY window ORDER BY message_count DESC, content ASC
+                ) AS rank
+         FROM content_counts
+       )
+       SELECT t.window, t.from_at, $4::timestamptz AS to_at, t.total_messages,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM collector_incidents i
+                WHERE i.room_id = $1 AND i.started_at < $4::timestamptz
+                  AND COALESCE(i.ended_at, $4::timestamptz) > t.from_at
+              ) THEN false ELSE NULL END AS data_complete,
+              r.rank, r.content, r.message_count,
+              CASE WHEN t.total_messages = 0 THEN 0
+                   ELSE r.message_count::float8 / t.total_messages END AS share
+       FROM window_totals t
+       LEFT JOIN ranked r ON r.window = t.window AND r.rank <= $6
+       ORDER BY t.ordinal, r.rank NULLS LAST`,
+      [roomId, windows, durations, at, maxDuration, limit]
+    )
+
+    const result = new Map(windows.map(window => [window, null]))
+    for (const row of rows) {
+      let item = result.get(row.window)
+      if (!item) {
+        item = {
+          window: row.window,
+          from: row.from_at.toISOString(),
+          to: row.to_at.toISOString(),
+          total_messages: String(row.total_messages),
+          data_complete: row.data_complete,
+          items: []
+        }
+        result.set(row.window, item)
+      }
+      if (row.rank !== null) {
+        item.items.push({
+          rank: String(row.rank),
+          content: row.content,
+          message_count: String(row.message_count),
+          share: Number(row.share)
+        })
+      }
+    }
+    return windows.map(window => result.get(window))
+  }
+
   async finalizeDailyTop(date) {
     const client = await this.pool.connect()
     try {

@@ -96,6 +96,7 @@ GET    /api/v1/rooms/:id/messages.csv
 
 GET    /api/v1/analytics/message-counts
 GET    /api/v1/analytics/top-messages
+GET    /api/v1/analytics/realtime-top-messages
 POST   /api/v1/analytics/rebuild
 
 GET    /api/v1/system/storage
@@ -113,6 +114,21 @@ GET    /metrics
 ```text
 Authorization: Bearer <ADMIN_API_TOKEN>
 ```
+
+### 实时短窗口 Top 榜
+
+一次请求可按同一截止时间查询最近 1、5、10 分钟的完整弹幕排行：
+
+```http
+GET /api/v1/analytics/realtime-top-messages?room_id=<uuid>&windows=1m,5m,10m&limit=10
+Authorization: Bearer <ADMIN_API_TOKEN>
+```
+
+- `windows` 可选，默认 `1m,5m,10m`，只接受这三个不重复的窗口。
+- `limit` 可选，默认 `10`，范围为 `1～50`。
+- `at` 可选，必须是带时区的 ISO 8601 时间；默认使用服务器当前时间。
+- 窗口采用 `[at - window, at)`，按 `occurred_at` 统计全部普通文本弹幕。
+- 响应在服务端缓存 12 秒；每个来源 IP 每分钟最多请求 60 次。
 
 ## 本地开发
 

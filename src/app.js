@@ -5,6 +5,56 @@ const { clampLimit, parseDate } = require('./utils')
 
 function buildApp({ config, database, detector, supervisor, spool, storage, archives, loggerOptions } = {}) {
   const app = Fastify({ logger: loggerOptions || { level: config.logLevel } })
+  const realtimeTopCache = new Map()
+  const realtimeTopRequests = new Map()
+
+  function realtimeTopError(message, code = 'INVALID_PARAMETER', statusCode = 400) {
+    return Object.assign(new Error(message), { code, statusCode })
+  }
+
+  function parseRealtimeWindows(value) {
+    const windows = String(value || '1m,5m,10m').split(',').map(item => item.trim())
+    const allowed = new Set(['1m', '5m', '10m'])
+    if (!windows.length || windows.some(window => !allowed.has(window)) || new Set(windows).size !== windows.length) {
+      throw realtimeTopError('windows 只支持不重复的 1m、5m、10m')
+    }
+    return windows
+  }
+
+  function parseRealtimeLimit(value) {
+    if (value === undefined) return 10
+    if (!/^\d+$/.test(String(value))) throw realtimeTopError('limit 必须是 1～50 的整数')
+    const limit = Number(value)
+    if (limit < 1 || limit > 50) throw realtimeTopError('limit 必须是 1～50 的整数')
+    return limit
+  }
+
+  function parseRealtimeAt(value) {
+    if (value === undefined) return new Date()
+    if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(String(value))) {
+      throw realtimeTopError('at 必须是带时区的 ISO 8601 时间')
+    }
+    return parseDate(value, 'at')
+  }
+
+  function enforceRealtimeTopRateLimit(ip) {
+    const now = Date.now()
+    let entry = realtimeTopRequests.get(ip)
+    if (!entry || now - entry.startedAt >= 60000) entry = { startedAt: now, count: 0 }
+    if (entry.count >= 60) throw realtimeTopError('请求过于频繁', 'RATE_LIMITED', 429)
+    entry.count += 1
+    realtimeTopRequests.set(ip, entry)
+    if (realtimeTopRequests.size > 10000) {
+      for (const [key, value] of realtimeTopRequests) {
+        if (now - value.startedAt >= 60000) realtimeTopRequests.delete(key)
+      }
+    }
+  }
+
+  function setRealtimeTopCache(key, value) {
+    if (realtimeTopCache.size >= 200) realtimeTopCache.delete(realtimeTopCache.keys().next().value)
+    realtimeTopCache.set(key, { expiresAt: Date.now() + 12000, value })
+  }
 
   app.register(fastifyStatic, {
     root: path.resolve(__dirname, '../public'),
@@ -165,6 +215,34 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
       throw Object.assign(new Error('room_id 和 YYYY-MM-DD 格式的 date 必填'), { statusCode: 400 })
     }
     return database.topMessages({ roomId, date, limit: clampLimit(request.query.limit, 10, 100) })
+  })
+
+  app.get('/api/v1/analytics/realtime-top-messages', async request => {
+    const { room_id: roomId, at: atValue } = request.query
+    if (!roomId) throw realtimeTopError('room_id 不能为空')
+    const windows = parseRealtimeWindows(request.query.windows)
+    const limit = parseRealtimeLimit(request.query.limit)
+    const at = parseRealtimeAt(atValue)
+    enforceRealtimeTopRateLimit(request.ip)
+
+    const cacheKey = `${roomId}|${windows.join(',')}|${limit}|${atValue || 'now'}`
+    const cached = realtimeTopCache.get(cacheKey)
+    if (cached && cached.expiresAt > Date.now()) return cached.value
+    if (cached) realtimeTopCache.delete(cacheKey)
+
+    if (!database.ready) throw realtimeTopError('数据源暂不可用', 'DATA_SOURCE_UNAVAILABLE', 503)
+    const room = await database.getRoom(roomId)
+    if (!room) throw realtimeTopError('房间不存在', 'ROOM_NOT_FOUND', 404)
+
+    const resultWindows = await database.realtimeTopMessages({ roomId, windows, at, limit })
+    const value = {
+      room_id: roomId,
+      as_of: at.toISOString(),
+      generated_at: new Date().toISOString(),
+      windows: resultWindows
+    }
+    setRealtimeTopCache(cacheKey, value)
+    return value
   })
 
   app.post('/api/v1/analytics/rebuild', async request => {
