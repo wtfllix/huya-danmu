@@ -25,7 +25,10 @@
         <div class="panel-heading">
           <div><p class="eyebrow">COLLECTOR</p><h2>监听状态</h2></div>
           <div class="button-row">
-            <select id="roomSelect" class="room-select hidden" aria-label="选择直播间"></select>
+            <label id="roomViewSwitcher" class="room-view-switcher hidden">
+              <span>查看房间</span>
+              <select id="roomSelect" class="room-select" aria-label="选择要查看的直播间"></select>
+            </label>
             <button id="refreshButton" class="icon-button" title="刷新">↻</button>
           </div>
         </div>

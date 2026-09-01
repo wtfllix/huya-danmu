@@ -64,7 +64,7 @@ async function loadRooms() {
     option.textContent = `${room.anchor_name || '未知主播'} · ${room.external_room_id}${room.is_default ? '（默认）' : ''}`
     roomSelect.append(option)
   }
-  roomSelect.classList.toggle('hidden', state.rooms.length < 2)
+  $('#roomViewSwitcher').classList.toggle('hidden', state.rooms.length < 2)
   if (state.room) roomSelect.value = state.room.id
 
   $('#roomEmpty').classList.toggle('hidden', Boolean(state.room))
