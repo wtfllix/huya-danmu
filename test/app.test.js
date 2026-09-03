@@ -11,7 +11,8 @@ function fixtures() {
     listArchiveRuns: async () => [],
     messageCounts: async () => [],
     topMessages: async () => [],
-    realtimeTopMessages: async () => []
+    realtimeTopMessages: async () => [],
+    sessionTopMessages: async () => null
   }
   const config = { logLevel: 'silent', apiToken: '', hotRetentionMonths: 12 }
   return {
@@ -95,4 +96,57 @@ test('实时 Top API 校验窗口、limit、时区和房间', async t => {
   assert.equal((await app.inject(`${base}&limit=51`)).statusCode, 400)
   assert.equal((await app.inject(`${base}&at=2026-09-01T20:15:30`)).statusCode, 400)
   assert.equal((await app.inject(base)).statusCode, 404)
+})
+
+test('场次 Top API 校验参数、缓存已结束场次并区分房间与场次不存在', async t => {
+  const deps = fixtures()
+  deps.database.getRoom = async id => id === 'room-1' ? { id } : null
+  let calls = 0
+  deps.database.sessionTopMessages = async ({ roomId, sessionId, limit }) => {
+    if (sessionId === '11111111-1111-1111-1111-111111111111') {
+      calls += 1
+      assert.equal(roomId, 'room-1')
+      assert.equal(limit, 100)
+      return {
+        session: {
+          status: 'completed',
+          detected_started_at: '2026-09-02T12:00:00.000Z',
+          detected_ended_at: '2026-09-02T19:00:00.000Z',
+          platform_started_at: null,
+          platform_ended_at: null,
+          title: '深夜场',
+          category: null
+        },
+        total_messages: '1500',
+        data_complete: null,
+        items: [{ rank: '1', content: '666', message_count: '80', share: 0.053 }]
+      }
+    }
+    return null
+  }
+  const app = buildApp(deps)
+  t.after(() => app.close())
+
+  const url = '/api/v1/analytics/session-top-messages?room_id=room-1&session_id=11111111-1111-1111-1111-111111111111&limit=100'
+  const first = await app.inject(url)
+  const second = await app.inject(url)
+  assert.equal(first.statusCode, 200)
+  assert.equal(second.statusCode, 200)
+  assert.equal(calls, 1)
+  assert.equal(first.json().session_id, '11111111-1111-1111-1111-111111111111')
+  assert.equal(first.json().session.title, '深夜场')
+  assert.deepEqual(first.json().items, [{ rank: '1', content: '666', message_count: '80', share: 0.053 }])
+
+  assert.equal(
+    (await app.inject('/api/v1/analytics/session-top-messages?room_id=room-1&session_id=not-a-uuid')).statusCode,
+    400
+  )
+  assert.equal(
+    (await app.inject('/api/v1/analytics/session-top-messages?room_id=missing&session_id=11111111-1111-1111-1111-111111111111')).statusCode,
+    404
+  )
+  assert.equal(
+    (await app.inject('/api/v1/analytics/session-top-messages?room_id=room-1&session_id=22222222-2222-2222-2222-222222222222')).statusCode,
+    404
+  )
 })

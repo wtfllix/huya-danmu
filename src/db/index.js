@@ -460,6 +460,79 @@ class Database {
     return windows.map(window => result.get(window))
   }
 
+  async sessionTopMessages({ roomId, sessionId, limit = 10 }) {
+    const { rows } = await this.query(
+      `WITH session_window AS MATERIALIZED (
+         SELECT s.status, s.metadata,
+                s.detected_started_at, s.detected_ended_at,
+                s.platform_started_at, s.platform_ended_at,
+                COALESCE(s.platform_started_at, s.detected_started_at) - interval '60 minutes' AS scan_from,
+                COALESCE(s.detected_ended_at, s.platform_ended_at, now()) + interval '120 minutes' AS scan_to,
+                EXISTS (
+                  SELECT 1 FROM collector_incidents i
+                  WHERE i.room_id = s.room_id
+                    AND i.started_at < COALESCE(s.detected_ended_at, s.platform_ended_at, now())
+                    AND COALESCE(i.ended_at, now()) > COALESCE(s.platform_started_at, s.detected_started_at)
+                ) AS data_incomplete
+         FROM live_sessions s
+         WHERE s.id = $2 AND s.room_id = $1
+       ), session_totals AS (
+         SELECT count(m.ingest_id)::bigint AS total_messages
+         FROM session_window w
+         JOIN danmu_messages m
+           ON m.room_id = $1 AND m.session_id = $2
+          AND m.occurred_at >= w.scan_from AND m.occurred_at < w.scan_to
+       ), content_counts AS (
+         SELECT m.content_normalized AS content, count(*)::bigint AS message_count
+         FROM session_window w
+         JOIN danmu_messages m
+           ON m.room_id = $1 AND m.session_id = $2
+          AND m.occurred_at >= w.scan_from AND m.occurred_at < w.scan_to
+         WHERE m.content_normalized <> ''
+         GROUP BY m.content_normalized
+       ), ranked AS (
+         SELECT content, message_count,
+                row_number() OVER (ORDER BY message_count DESC, content ASC) AS rank
+         FROM content_counts
+       )
+       SELECT w.status, w.metadata, w.detected_started_at, w.detected_ended_at,
+              w.platform_started_at, w.platform_ended_at, w.data_incomplete,
+              COALESCE(t.total_messages, 0)::bigint AS total_messages,
+              r.rank, r.content, r.message_count,
+              CASE WHEN COALESCE(t.total_messages, 0) = 0 THEN 0
+                   ELSE r.message_count::float8 / t.total_messages END AS share
+       FROM session_window w
+       CROSS JOIN session_totals t
+       LEFT JOIN ranked r ON r.rank <= $3
+       ORDER BY r.rank NULLS LAST`,
+      [roomId, sessionId, limit]
+    )
+    if (!rows.length) return null
+    const head = rows[0]
+    const iso = value => (value instanceof Date ? value.toISOString() : value ? new Date(value).toISOString() : null)
+    return {
+      session: {
+        status: head.status,
+        detected_started_at: iso(head.detected_started_at),
+        detected_ended_at: iso(head.detected_ended_at),
+        platform_started_at: iso(head.platform_started_at),
+        platform_ended_at: iso(head.platform_ended_at),
+        title: head.metadata?.title ?? null,
+        category: head.metadata?.category ?? null
+      },
+      total_messages: String(head.total_messages),
+      data_complete: head.data_incomplete ? false : null,
+      items: rows
+        .filter(row => row.rank !== null && row.rank <= limit)
+        .map(row => ({
+          rank: String(row.rank),
+          content: row.content,
+          message_count: String(row.message_count),
+          share: Number(row.share)
+        }))
+    }
+  }
+
   async finalizeDailyTop(date) {
     const client = await this.pool.connect()
     try {

@@ -6,9 +6,9 @@ const { clampLimit, parseDate } = require('./utils')
 function buildApp({ config, database, detector, supervisor, spool, storage, archives, loggerOptions } = {}) {
   const app = Fastify({ logger: loggerOptions || { level: config.logLevel } })
   const realtimeTopCache = new Map()
-  const realtimeTopRequests = new Map()
+  const sessionTopCache = new Map()
 
-  function realtimeTopError(message, code = 'INVALID_PARAMETER', statusCode = 400) {
+  function analyticsError(message, code = 'INVALID_PARAMETER', statusCode = 400) {
     return Object.assign(new Error(message), { code, statusCode })
   }
 
@@ -16,44 +16,49 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
     const windows = String(value || '1m,5m,10m').split(',').map(item => item.trim())
     const allowed = new Set(['1m', '5m', '10m'])
     if (!windows.length || windows.some(window => !allowed.has(window)) || new Set(windows).size !== windows.length) {
-      throw realtimeTopError('windows 只支持不重复的 1m、5m、10m')
+      throw analyticsError('windows 只支持不重复的 1m、5m、10m')
     }
     return windows
   }
 
   function parseRealtimeLimit(value) {
     if (value === undefined) return 10
-    if (!/^\d+$/.test(String(value))) throw realtimeTopError('limit 必须是 1～50 的整数')
+    if (!/^\d+$/.test(String(value))) throw analyticsError('limit 必须是 1～50 的整数')
     const limit = Number(value)
-    if (limit < 1 || limit > 50) throw realtimeTopError('limit 必须是 1～50 的整数')
+    if (limit < 1 || limit > 50) throw analyticsError('limit 必须是 1～50 的整数')
     return limit
   }
 
   function parseRealtimeAt(value) {
     if (value === undefined) return new Date()
     if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(String(value))) {
-      throw realtimeTopError('at 必须是带时区的 ISO 8601 时间')
+      throw analyticsError('at 必须是带时区的 ISO 8601 时间')
     }
     return parseDate(value, 'at')
   }
 
-  function enforceRealtimeTopRateLimit(ip) {
-    const now = Date.now()
-    let entry = realtimeTopRequests.get(ip)
-    if (!entry || now - entry.startedAt >= 60000) entry = { startedAt: now, count: 0 }
-    if (entry.count >= 60) throw realtimeTopError('请求过于频繁', 'RATE_LIMITED', 429)
-    entry.count += 1
-    realtimeTopRequests.set(ip, entry)
-    if (realtimeTopRequests.size > 10000) {
-      for (const [key, value] of realtimeTopRequests) {
-        if (now - value.startedAt >= 60000) realtimeTopRequests.delete(key)
+  function createRateLimiter(limitPerMinute) {
+    const requests = new Map()
+    return ip => {
+      const now = Date.now()
+      let entry = requests.get(ip)
+      if (!entry || now - entry.startedAt >= 60000) entry = { startedAt: now, count: 0 }
+      if (entry.count >= limitPerMinute) throw analyticsError('请求过于频繁', 'RATE_LIMITED', 429)
+      entry.count += 1
+      requests.set(ip, entry)
+      if (requests.size > 10000) {
+        for (const [key, value] of requests) {
+          if (now - value.startedAt >= 60000) requests.delete(key)
+        }
       }
     }
   }
+  const enforceRealtimeTopRateLimit = createRateLimiter(60)
+  const enforceSessionTopRateLimit = createRateLimiter(60)
 
-  function setRealtimeTopCache(key, value) {
-    if (realtimeTopCache.size >= 200) realtimeTopCache.delete(realtimeTopCache.keys().next().value)
-    realtimeTopCache.set(key, { expiresAt: Date.now() + 12000, value })
+  function setCacheEntry(cache, key, value, ttlMs) {
+    if (cache.size >= 200) cache.delete(cache.keys().next().value)
+    cache.set(key, { expiresAt: Date.now() + ttlMs, value })
   }
 
   app.register(fastifyStatic, {
@@ -219,7 +224,7 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
 
   app.get('/api/v1/analytics/realtime-top-messages', async request => {
     const { room_id: roomId, at: atValue } = request.query
-    if (!roomId) throw realtimeTopError('room_id 不能为空')
+    if (!roomId) throw analyticsError('room_id 不能为空')
     const windows = parseRealtimeWindows(request.query.windows)
     const limit = parseRealtimeLimit(request.query.limit)
     const at = parseRealtimeAt(atValue)
@@ -230,9 +235,9 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
     if (cached && cached.expiresAt > Date.now()) return cached.value
     if (cached) realtimeTopCache.delete(cacheKey)
 
-    if (!database.ready) throw realtimeTopError('数据源暂不可用', 'DATA_SOURCE_UNAVAILABLE', 503)
+    if (!database.ready) throw analyticsError('数据源暂不可用', 'DATA_SOURCE_UNAVAILABLE', 503)
     const room = await database.getRoom(roomId)
-    if (!room) throw realtimeTopError('房间不存在', 'ROOM_NOT_FOUND', 404)
+    if (!room) throw analyticsError('房间不存在', 'ROOM_NOT_FOUND', 404)
 
     const resultWindows = await database.realtimeTopMessages({ roomId, windows, at, limit })
     const value = {
@@ -241,7 +246,37 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
       generated_at: new Date().toISOString(),
       windows: resultWindows
     }
-    setRealtimeTopCache(cacheKey, value)
+    setCacheEntry(realtimeTopCache, cacheKey, value, 12000)
+    return value
+  })
+
+  app.get('/api/v1/analytics/session-top-messages', async request => {
+    const { room_id: roomId, session_id: sessionId } = request.query
+    if (!roomId) throw analyticsError('room_id 不能为空')
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId || ''))) {
+      throw analyticsError('session_id 必须是直播场次 UUID')
+    }
+    const limit = clampLimit(request.query.limit, 10, 100)
+    enforceSessionTopRateLimit(request.ip)
+
+    const cacheKey = `${roomId}|${sessionId}|${limit}`
+    const cached = sessionTopCache.get(cacheKey)
+    if (cached && cached.expiresAt > Date.now()) return cached.value
+    if (cached) sessionTopCache.delete(cacheKey)
+
+    if (!database.ready) throw analyticsError('数据源暂不可用', 'DATA_SOURCE_UNAVAILABLE', 503)
+    const room = await database.getRoom(roomId)
+    if (!room) throw analyticsError('房间不存在', 'ROOM_NOT_FOUND', 404)
+
+    const result = await database.sessionTopMessages({ roomId, sessionId, limit })
+    if (!result) throw analyticsError('直播场次不存在', 'SESSION_NOT_FOUND', 404)
+    const value = {
+      room_id: roomId,
+      session_id: sessionId,
+      generated_at: new Date().toISOString(),
+      ...result
+    }
+    setCacheEntry(sessionTopCache, cacheKey, value, result.session.status === 'active' ? 12000 : 300000)
     return value
   })
 
