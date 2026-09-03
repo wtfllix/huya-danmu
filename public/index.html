@@ -13,6 +13,10 @@
       <h1>虎牙弹幕观察台</h1>
     </div>
     <div class="header-actions">
+      <nav class="primary-nav" aria-label="主要内容">
+        <a href="#historical-ranking">历史热榜</a>
+        <a href="#live-messages">直播弹幕</a>
+      </nav>
       <span id="clock" class="muted"></span>
       <button id="tokenButton" class="button ghost">访问令牌</button>
       <span id="healthBadge" class="badge unknown">连接中</span>
@@ -20,6 +24,17 @@
   </header>
 
   <main>
+    <section class="content-grid featured-content">
+      <article id="historical-ranking" class="panel">
+        <div class="panel-heading"><div><p class="eyebrow">DAILY TOP 10</p><h2>历史热榜</h2></div></div>
+        <ol id="topMessages" class="ranking"><li class="empty-row">暂无数据</li></ol>
+      </article>
+      <article id="live-messages" class="panel">
+        <div class="panel-heading"><div><p class="eyebrow">LIVE FEED</p><h2>直播弹幕</h2></div><button id="exportButton" class="button ghost">导出当日 CSV</button></div>
+        <div id="recentMessages" class="message-feed"><p class="empty-row">暂无数据</p></div>
+      </article>
+    </section>
+
     <section class="hero-grid">
       <article class="panel room-panel">
         <div class="panel-heading">
@@ -88,17 +103,6 @@
         <div><span>峰值数量</span><strong id="peakCount">0</strong></div>
       </div>
       <div class="chart-wrap"><canvas id="messageChart"></canvas></div>
-    </section>
-
-    <section class="content-grid">
-      <article class="panel">
-        <div class="panel-heading"><div><p class="eyebrow">DAILY TOP 10</p><h2>高频弹幕</h2></div></div>
-        <ol id="topMessages" class="ranking"><li class="empty-row">暂无数据</li></ol>
-      </article>
-      <article class="panel">
-        <div class="panel-heading"><div><p class="eyebrow">LIVE FEED</p><h2>最近弹幕</h2></div><button id="exportButton" class="button ghost">导出当日 CSV</button></div>
-        <div id="recentMessages" class="message-feed"><p class="empty-row">暂无数据</p></div>
-      </article>
     </section>
 
     <section class="panel archive-panel">

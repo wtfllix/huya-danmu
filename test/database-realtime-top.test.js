@@ -9,6 +9,9 @@ test('实时 Top 查询扫描完整最长窗口并按请求顺序组装结果', 
     assert.match(sql, /candidate_messages AS MATERIALIZED/)
     assert.match(sql, /occurred_at >=/)
     assert.match(sql, /content_normalized <> ''/)
+    assert.match(sql, /AS requested\("window", duration_seconds, ordinal\)/)
+    assert.match(sql, /SELECT "window", content, message_count/)
+    assert.match(sql, /PARTITION BY "window"/)
     assert.deepEqual(params, ['room-1', ['1m', '5m'], [60, 300], at, 300, 10])
     return {
       rows: [

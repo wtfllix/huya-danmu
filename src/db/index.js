@@ -394,7 +394,7 @@ class Database {
          SELECT requested.window, requested.duration_seconds, requested.ordinal,
                 $4::timestamptz - make_interval(secs => requested.duration_seconds) AS from_at
          FROM unnest($2::text[], $3::integer[]) WITH ORDINALITY
-              AS requested(window, duration_seconds, ordinal)
+              AS requested("window", duration_seconds, ordinal)
        ), candidate_messages AS MATERIALIZED (
          SELECT ingest_id, occurred_at, content_normalized
          FROM danmu_messages
@@ -413,9 +413,9 @@ class Database {
          WHERE m.content_normalized <> ''
          GROUP BY w.window, m.content_normalized
        ), ranked AS (
-         SELECT window, content, message_count,
+         SELECT "window", content, message_count,
                 row_number() OVER (
-                  PARTITION BY window ORDER BY message_count DESC, content ASC
+                  PARTITION BY "window" ORDER BY message_count DESC, content ASC
                 ) AS rank
          FROM content_counts
        )
