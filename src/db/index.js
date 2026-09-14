@@ -5,6 +5,7 @@ const { Transform } = require('node:stream')
 const { Pool } = require('pg')
 const QueryStream = require('pg-query-stream')
 const { normalizeContent, sha256 } = require('../utils')
+const { windowTopMessages } = require('./window-top-messages')
 
 class Database {
   constructor({ connectionString, ssl = false, logger = console }) {
@@ -383,6 +384,10 @@ class Database {
       [roomId, date, limit]
     )
     return historical.rows
+  }
+
+  async windowTopMessages(params) {
+    return windowTopMessages(this, params)
   }
 
   async realtimeTopMessages({ roomId, windows, at, limit = 10 }) {

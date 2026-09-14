@@ -25,6 +25,70 @@ function fixtures() {
   }
 }
 
+test('batch windows validates parameters and does not cache repaired data', async t => {
+  const deps = fixtures()
+  deps.database.getRoom = async () => ({ id: 'room-1' })
+  let calls = 0
+  deps.database.windowTopMessages = async params => {
+    assert.equal(params.limit, 50)
+    assert.equal(params.timezone, 'Asia/Shanghai')
+    calls += 1
+    return [{ total_messages: String(calls), data_complete: null, items: [] }]
+  }
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const base = '/api/v1/analytics/window-top-messages?room_id=room-1&date=2026-09-06'
+  assert.equal((await app.inject(base)).json().windows[0].total_messages, '1')
+  const repaired = await app.inject(base)
+  assert.equal(repaired.json().windows[0].total_messages, '2')
+  assert.equal(repaired.headers['cache-control'], 'no-store')
+  for (const extra of ['&window=1m', '&limit=51', '&timezone=invalid', '&from=2026-09-01']) {
+    assert.equal((await app.inject(base + extra)).statusCode, 400)
+  }
+})
+
+test('batch errors never become empty successful rankings', async t => {
+  const deps = fixtures()
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const url = '/api/v1/analytics/window-top-messages?room_id=room-1&date=2026-09-06'
+  assert.equal((await app.inject(url)).statusCode, 404)
+  deps.database.ready = false
+  assert.equal((await app.inject(url)).statusCode, 503)
+  deps.database.ready = true
+  deps.database.getRoom = async () => ({ id: 'room-1' })
+  deps.database.windowTopMessages = async () => { throw new Error('query timeout') }
+  const failed = await app.inject(url)
+  assert.equal(failed.statusCode, 503)
+  assert.equal(failed.json().code, 'ANALYTICS_QUERY_FAILED')
+  assert.equal(failed.json().windows, undefined)
+})
+
+test('per-IP per-route limits are independent and include Retry-After', async t => {
+  const deps = fixtures()
+  deps.database.getRoom = async () => ({ id: 'room-1' })
+  deps.database.windowTopMessages = async () => []
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const batch = '/api/v1/analytics/window-top-messages?room_id=room-1&date=2026-09-06'
+  for (let i = 0; i < 6; i++) assert.equal((await app.inject(batch)).statusCode, 200)
+  const blocked = await app.inject(batch)
+  assert.equal(blocked.statusCode, 429)
+  assert.ok(Number(blocked.headers['retry-after']) >= 1)
+  assert.equal((await app.inject({ url: batch, remoteAddress: '192.0.2.1' })).statusCode, 200)
+  const realtime = '/api/v1/analytics/realtime-top-messages?room_id=room-1'
+  for (let i = 0; i < 60; i++) assert.equal((await app.inject(realtime)).statusCode, 200)
+  const realtimeBlocked = await app.inject(realtime)
+  assert.equal(realtimeBlocked.statusCode, 429)
+  assert.ok(Number(realtimeBlocked.headers['retry-after']) >= 1)
+  for (const url of ['/api/v1/rooms', '/health/live', '/health/ready',
+    '/api/v1/analytics/top-messages?room_id=room-1&date=2026-09-06']) {
+    assert.equal((await app.inject(url)).statusCode, 200)
+  }
+  const session = await app.inject('/api/v1/analytics/session-top-messages?room_id=room-1&session_id=11111111-1111-1111-1111-111111111111')
+  assert.equal(session.statusCode, 404)
+})
+
 test('健康检查和静态管理页面可访问', async t => {
   const app = buildApp(fixtures())
   t.after(() => app.close())

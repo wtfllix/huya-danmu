@@ -130,6 +130,17 @@ Authorization: Bearer <ADMIN_API_TOKEN>
 - 窗口采用 `[at - window, at)`，按 `occurred_at` 统计全部普通文本弹幕。
 - 响应在服务端缓存 12 秒；每个来源 IP 每分钟最多请求 60 次。
 
+### 批量分时 Top 榜
+
+```http
+GET /api/v1/analytics/window-top-messages?room_id=<uuid>&date=2026-09-06&timezone=Asia%2FShanghai&window=10m&limit=50
+```
+
+一次返回当天所有已结束的十分钟时段，每段独立 Top 50。新接口按 IP 独立限流为每分钟 6 次，
+每进程最多两个并发批量请求；429 附带 `Retry-After`。不缓存批量结果，以免补采后返回旧数据。
+完整性保持保守语义：已知缺口为 `false`，没有证据证明完整时为 `null`，查询失败返回 503。
+参数、状态、限流审计和执行计划验证见 [批量统计说明](docs/WINDOW_TOP_MESSAGES.md)。
+
 ## 本地开发
 
 需要 Node.js 22 或更高版本和 PostgreSQL 16/17。

@@ -2,11 +2,13 @@ const path = require('node:path')
 const Fastify = require('fastify')
 const fastifyStatic = require('@fastify/static')
 const { clampLimit, parseDate } = require('./utils')
+const { parseWindowQuery, createWindowTopService } = require('./services/window-top-service')
 
 function buildApp({ config, database, detector, supervisor, spool, storage, archives, loggerOptions } = {}) {
   const app = Fastify({ logger: loggerOptions || { level: config.logLevel } })
   const realtimeTopCache = new Map()
   const sessionTopCache = new Map()
+  const getWindowTop = createWindowTopService(database)
 
   function analyticsError(message, code = 'INVALID_PARAMETER', statusCode = 400) {
     return Object.assign(new Error(message), { code, statusCode })
@@ -43,7 +45,11 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
       const now = Date.now()
       let entry = requests.get(ip)
       if (!entry || now - entry.startedAt >= 60000) entry = { startedAt: now, count: 0 }
-      if (entry.count >= limitPerMinute) throw analyticsError('请求过于频繁', 'RATE_LIMITED', 429)
+      if (entry.count >= limitPerMinute) {
+        throw Object.assign(analyticsError('请求过于频繁', 'RATE_LIMITED', 429), {
+          retryAfter: Math.max(1, Math.ceil((entry.startedAt + 60000 - now) / 1000))
+        })
+      }
       entry.count += 1
       requests.set(ip, entry)
       if (requests.size > 10000) {
@@ -55,6 +61,7 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
   }
   const enforceRealtimeTopRateLimit = createRateLimiter(60)
   const enforceSessionTopRateLimit = createRateLimiter(60)
+  const enforceWindowTopRateLimit = createRateLimiter(6)
 
   function setCacheEntry(cache, key, value, ttlMs) {
     if (cache.size >= 200) cache.delete(cache.keys().next().value)
@@ -76,6 +83,7 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
   app.setErrorHandler((error, request, reply) => {
     const statusCode = error.statusCode || (error.code === '23505' ? 409 : 500)
     if (statusCode >= 500) request.log.error({ err: error }, '请求处理失败')
+    if (statusCode === 429) reply.header('Retry-After', error.retryAfter || 60)
     reply.code(statusCode).send({ error: error.message, code: error.code || 'REQUEST_FAILED' })
   })
 
@@ -220,6 +228,13 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
       throw Object.assign(new Error('room_id 和 YYYY-MM-DD 格式的 date 必填'), { statusCode: 400 })
     }
     return database.topMessages({ roomId, date, limit: clampLimit(request.query.limit, 10, 100) })
+  })
+
+  app.get('/api/v1/analytics/window-top-messages', async (request, reply) => {
+    enforceWindowTopRateLimit(request.ip)
+    const params = parseWindowQuery(request.query)
+    reply.header('Cache-Control', 'no-store')
+    return getWindowTop(params, request.log)
   })
 
   app.get('/api/v1/analytics/realtime-top-messages', async request => {
