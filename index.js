@@ -14,6 +14,7 @@
 //   client.start() / client.stop()
 const ws = require('ws')
 const https = require('https')
+const zlib = require('zlib')
 const crypto = require('crypto')
 const { EventEmitter } = require('events')
 const { Taf, HUYA } = require('./lib')
@@ -53,6 +54,7 @@ const WS_URL = 'ws://ws.api.huya.com'
 const WSS_URL = 'wss://cdnws.api.huya.com'
 const HEARTBEAT_INTERVAL = 60000
 const HANDSHAKE_TIMEOUT = 15000
+const MAX_PAGE_SIZE = 5 * 1024 * 1024
 const UA = 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Mobile Safari/537.36'
 
 function toAB(b) { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }
@@ -81,18 +83,37 @@ class huya_danmu extends EventEmitter {
 
   _fetch(url) {
     return new Promise((resolve, reject) => {
-      const req = https.get(url, { headers: { 'User-Agent': UA } }, res => {
+      const req = https.get(url, { headers: { 'User-Agent': UA, 'Accept-Encoding': 'gzip, deflate, br' } }, res => {
         if (res.statusCode < 200 || res.statusCode >= 300) {
           res.resume()
           reject(new Error(`虎牙页面请求失败: HTTP ${res.statusCode}`))
           return
         }
-        let d = ''
+        const chunks = []
+        let size = 0
         res.on('data', c => {
-          d += c
-          if (d.length > 5 * 1024 * 1024) req.destroy(new Error('虎牙页面响应超过 5 MB'))
+          size += c.length
+          if (size > MAX_PAGE_SIZE) {
+            req.destroy(new Error('虎牙页面响应超过 5 MB'))
+            return
+          }
+          chunks.push(c)
         })
-        res.on('end', () => resolve(d))
+        res.on('end', () => {
+          try {
+            let buf = Buffer.concat(chunks)
+            const options = { maxOutputLength: MAX_PAGE_SIZE }
+            switch (String(res.headers['content-encoding'] || '').trim().toLowerCase()) {
+              case 'gzip': buf = zlib.gunzipSync(buf, options); break
+              case 'deflate': buf = zlib.inflateSync(buf, options); break
+              case 'br': buf = zlib.brotliDecompressSync(buf, options); break
+            }
+            if (buf.length > MAX_PAGE_SIZE) throw new Error('虎牙页面响应超过 5 MB')
+            resolve(buf.toString('utf8'))
+          } catch (error) {
+            reject(error)
+          }
+        })
       })
       req.on('error', reject)
       req.setTimeout(15000, () => req.destroy(new Error('request timeout')))

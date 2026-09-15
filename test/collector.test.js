@@ -1,8 +1,57 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const EventEmitter = require('node:events')
+const https = require('node:https')
+const zlib = require('node:zlib')
 const HuyaDanmu = require('../index')
 const { Taf, HUYA } = require('../lib')
+
+function mockHttpsResponse(t, { body, encoding, statusCode = 200 }) {
+  const originalGet = https.get
+  let requestOptions
+  https.get = (url, options, callback) => {
+    requestOptions = options
+    const request = new EventEmitter()
+    request.setTimeout = () => request
+    request.destroy = error => request.emit('error', error)
+    process.nextTick(() => {
+      const response = new EventEmitter()
+      response.statusCode = statusCode
+      response.headers = encoding ? { 'content-encoding': encoding } : {}
+      response.resume = () => {}
+      callback(response)
+      if (statusCode >= 200 && statusCode < 300) {
+        response.emit('data', body.subarray(0, Math.ceil(body.length / 2)))
+        response.emit('data', body.subarray(Math.ceil(body.length / 2)))
+        response.emit('end')
+      }
+    })
+    return request
+  }
+  t.after(() => { https.get = originalGet })
+  return () => requestOptions
+}
+
+for (const [encoding, compress] of [
+  ['gzip', zlib.gzipSync],
+  ['deflate', zlib.deflateSync],
+  ['br', zlib.brotliCompressSync]
+]) {
+  test(`页面请求可解压 ${encoding} 响应`, async t => {
+    const html = '<script>{"lUid":1860008570,"lYyid":2112672604}</script>'
+    const getRequestOptions = mockHttpsResponse(t, { body: compress(Buffer.from(html)), encoding })
+    const client = new HuyaDanmu('116864')
+
+    assert.equal(await client._fetch('https://m.huya.com/116864'), html)
+    assert.equal(getRequestOptions().headers['Accept-Encoding'], 'gzip, deflate, br')
+  })
+}
+
+test('页面请求拒绝非成功状态码', async t => {
+  mockHttpsResponse(t, { body: Buffer.alloc(0), statusCode: 503 })
+  const client = new HuyaDanmu('116864')
+  await assert.rejects(client._fetch('https://m.huya.com/116864'), /HTTP 503/)
+})
 
 test('客户端支持停止后再次启动且保留业务监听器', async () => {
   class Probe extends HuyaDanmu {
