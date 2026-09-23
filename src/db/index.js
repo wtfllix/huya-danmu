@@ -27,12 +27,36 @@ class Database {
   }
 
   async migrate() {
-    const migrationPath = path.resolve(__dirname, '../../migrations/001_init.sql')
-    const sql = await fs.readFile(migrationPath, 'utf8')
-    await this.pool.query(sql)
-    await this.pool.query(
-      `INSERT INTO schema_migrations(version) VALUES ('001_init') ON CONFLICT DO NOTHING`
-    )
+    const migrationsDir = path.resolve(__dirname, '../../migrations')
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )
+    `)
+    const files = (await fs.readdir(migrationsDir))
+      .filter(file => /^\d+_.+\.sql$/.test(file))
+      .sort()
+    for (const file of files) {
+      const version = file.replace(/\.sql$/, '')
+      const applied = await this.pool.query('SELECT 1 FROM schema_migrations WHERE version = $1', [version])
+      if (applied.rowCount) continue
+      const sql = await fs.readFile(path.join(migrationsDir, file), 'utf8')
+      const client = await this.pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query(sql)
+        await client.query(
+          `INSERT INTO schema_migrations(version) VALUES ($1) ON CONFLICT DO NOTHING`, [version]
+        )
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    }
     this.ready = true
   }
 
@@ -185,6 +209,22 @@ class Database {
     const { rows } = await this.query(
       `SELECT * FROM live_sessions WHERE room_id = $1 ORDER BY detected_started_at DESC LIMIT $2`,
       [roomId, limit]
+    )
+    return rows
+  }
+
+  async listLatestActivePaidMessageSnapshots() {
+    const { rows } = await this.query(
+      `SELECT DISTINCT ON (stream.room_id)
+         stream.room_id, stream.session_id, stream.occurred_at, stream.received_at, stream.payload
+       FROM stream_events stream
+       INNER JOIN live_sessions session
+         ON session.id = stream.session_id
+        AND session.room_id = stream.room_id
+        AND session.status = 'active'
+       WHERE stream.event_type = 'paid_message_snapshot'
+         AND stream.session_id = session.id
+       ORDER BY stream.room_id, stream.received_at DESC, stream.occurred_at DESC, stream.ingest_id DESC`
     )
     return rows
   }

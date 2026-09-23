@@ -10,6 +10,14 @@ function integer(name, fallback, min = 0) {
   return value
 }
 
+function number(name, fallback, min = Number.NEGATIVE_INFINITY) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value < min) throw new Error(`${name} 必须是大于等于 ${min} 的数字`)
+  return value
+}
+
 function boolean(name, fallback = false) {
   const raw = process.env[name]
   if (raw === undefined || raw === '') return fallback
@@ -35,6 +43,8 @@ function loadConfig() {
     offlineConfirmations: integer('OFFLINE_CONFIRMATIONS', 2, 1),
     ingestBatchSize: integer('INGEST_BATCH_SIZE', 200, 1),
     ingestFlushMs: integer('INGEST_FLUSH_MS', 250, 25),
+    bigGiftThresholdHuyaCoin: number('BIG_GIFT_THRESHOLD_HUYA_COIN', 100, 0),
+    realtimeRingSize: integer('REALTIME_RING_SIZE', 3000, 1),
     dataDir,
     spoolDir: resolvePath(process.env.SPOOL_DIR, path.join(dataDir, 'spool')),
     archiveDir: resolvePath(process.env.ARCHIVE_DIR, path.join(dataDir, 'archives')),
@@ -51,4 +61,4 @@ function loadConfig() {
   }
 }
 
-module.exports = { loadConfig, integer, boolean }
+module.exports = { loadConfig, integer, number, boolean }

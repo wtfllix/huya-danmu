@@ -357,6 +357,12 @@ Taf.DataHelp = {
             t
     }
     ,
+    Taf.BinBuffer.prototype.skip = function (t) {
+        if (!Number.isInteger(t) || 0 > t || this.position + t > this.len)
+            throw new RangeError("skip exceeds buffer bounds");
+        this.position += t
+    }
+    ,
     Taf.BinBuffer.prototype.memset = function (t, e, i) {
         this.allocate(i),
             new Uint8Array(this.buf).set(new Uint8Array(t, e, i), this.position)
@@ -405,8 +411,10 @@ Taf.DataHelp = {
     ,
     Taf.BinBuffer.prototype.writeInt64 = function (t) {
         this.allocate(8),
-            this.vew.setUint32(this.position, parseInt(t / 4294967296)),
-            this.vew.setUint32(this.position + 4, t % 4294967296),
+            t = BigInt(String(t)),
+            t = BigInt.asUintN(64, t),
+            this.vew.setUint32(this.position, Number((t >> 32n) & 0xffffffffn)),
+            this.vew.setUint32(this.position + 4, Number(t & 0xffffffffn)),
             this.position += 8,
             this.len = this.position
     }
@@ -475,6 +483,13 @@ Taf.DataHelp = {
             , e = this.vew.getUint32(this.position + 4);
         return this.position += 8,
             4294967296 * t + e
+    }
+    ,
+    Taf.BinBuffer.prototype.readInt64String = function () {
+        var t = BigInt(this.vew.getUint32(this.position))
+            , e = BigInt(this.vew.getUint32(this.position + 4));
+        return this.position += 8,
+            String((t << 32n) | e)
     }
     ,
     Taf.BinBuffer.prototype.readFloat = function () {
@@ -642,30 +657,30 @@ Taf.DataHelp = {
     Taf.JceInputStream.prototype.skipField = function (t) {
         switch (t) {
             case Taf.DataHelp.EN_INT8:
-                this.buf.position += 1;
+                this.buf.skip(1);
                 break;
             case Taf.DataHelp.EN_INT16:
-                this.buf.position += 2;
+                this.buf.skip(2);
                 break;
             case Taf.DataHelp.EN_INT32:
-                this.buf.position += 4;
+                this.buf.skip(4);
                 break;
             case Taf.DataHelp.EN_INT64:
-                this.buf.position += 8;
+                this.buf.skip(8);
                 break;
             case Taf.DataHelp.EN_FLOAT:
-                this.buf.position += 4;
+                this.buf.skip(4);
                 break;
             case Taf.DataHelp.EN_DOUBLE:
-                this.buf.position += 8;
+                this.buf.skip(8);
                 break;
             case Taf.DataHelp.EN_STRING1:
                 var e = this.buf.readUInt8();
-                this.buf.position += e;
+                this.buf.skip(e);
                 break;
             case Taf.DataHelp.EN_STRING4:
                 var i = this.buf.readInt32();
-                this.buf.position += i;
+                this.buf.skip(i);
                 break;
             case Taf.DataHelp.EN_STRUCTBEGIN:
                 this.skipToStructEnd();
@@ -683,7 +698,8 @@ Taf.DataHelp = {
                 var s = this.readFrom();
                 if (s.type != Taf.DataHelp.EN_INT8)
                     throw Error("skipField with invalid type, type value: " + t + "," + s.type);
-                this.buf.position += this.readInt32(0, !0);
+                var o = this.readInt32(0, !0);
+                this.buf.skip(o);
                 break;
             case Taf.DataHelp.EN_LIST:
                 for (var r = this.readInt32(0, !0), n = 0; r > n; ++n) {

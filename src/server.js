@@ -6,12 +6,24 @@ const { DurableSpool } = require('./services/durable-spool')
 const { CollectorSupervisor } = require('./services/collector-supervisor')
 const { StorageService } = require('./services/storage-service')
 const { ArchiveService } = require('./services/archive-service')
+const { RealtimeEventBus } = require('./services/realtime-event-bus')
 const { buildApp } = require('./app')
 
 function shanghaiDate(date = new Date(Date.now() - 86400000)) {
   return new Intl.DateTimeFormat('sv-SE', {
     timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'
   }).format(date)
+}
+
+async function startupPhase(name, action, logger = console) {
+  try {
+    const result = await action()
+    logger.info?.(name)
+    return result
+  } catch (error) {
+    logger.error?.({ error, phase: name }, `startup failed: ${name}`)
+    throw error
+  }
 }
 
 async function main() {
@@ -23,7 +35,8 @@ async function main() {
   ])
 
   const database = new Database({ connectionString: config.databaseUrl, ssl: config.databaseSsl })
-  await database.migrate()
+  await startupPhase('database connected', () => database.query('SELECT 1'))
+  await startupPhase('migrations applied', () => database.migrate())
   const detector = new HuyaStatusDetector()
   const spool = new DurableSpool({
     directory: config.spoolDir,
@@ -31,8 +44,12 @@ async function main() {
     flushMs: config.ingestFlushMs,
     processBatch: events => database.insertEventBatch(events)
   })
-  await spool.start()
-  const supervisor = new CollectorSupervisor({ database, detector, spool, config })
+  await startupPhase('durable spool started', () => spool.start())
+  const eventBus = new RealtimeEventBus({ ringSize: config.realtimeRingSize })
+  console.info('realtime event bus initialized')
+  const supervisor = new CollectorSupervisor({ database, detector, spool, config, eventBus })
+  const restoredRooms = await startupPhase('warm restore', () => supervisor.warmRestorePaidSnapshots())
+  console.info(`warm restore completed: ${restoredRooms} room(s)`)
   const storage = new StorageService({
     database,
     archiveDir: config.archiveDir,
@@ -44,10 +61,12 @@ async function main() {
   const archives = new ArchiveService({
     database, archiveDir: config.archiveDir, backupPath: config.backupPath
   })
-  const app = buildApp({ config, database, detector, supervisor, spool, storage, archives })
+  const app = buildApp({ config, database, detector, supervisor, spool, storage, archives, eventBus })
 
-  await app.listen({ host: config.host, port: config.port })
-  await supervisor.start()
+  const address = await startupPhase('http server listen',
+    () => app.listen({ host: config.host, port: config.port }))
+  console.info(`http server listening: ${address}`)
+  await startupPhase('collector started', () => supervisor.start())
   const sampleStorage = async () => {
     const samples = await storage.sample()
     if (samples.some(item => ['high', 'critical'].includes(item.status))) {
@@ -97,4 +116,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { main, shanghaiDate }
+module.exports = { main, shanghaiDate, startupPhase }

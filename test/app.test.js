@@ -25,6 +25,16 @@ function fixtures() {
   }
 }
 
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 test('batch windows validates parameters and does not cache repaired data', async t => {
   const deps = fixtures()
   deps.database.getRoom = async () => ({ id: 'room-1' })
@@ -148,6 +158,241 @@ test('实时 Top API 使用同一截止时间返回多个窗口并缓存默认�
   assert.equal(calls, 1)
   assert.equal(first.json().as_of, second.json().as_of)
   assert.deepEqual(first.json().windows.map(item => item.window), ['1m', '5m', '10m'])
+})
+
+test('实时 Top API 使用 5 秒 TTL 并合并冷缓存和过期瞬间的并发查询', async t => {
+  const originalDateNow = Date.now
+  let now = Date.parse('2026-09-22T00:00:00.000Z')
+  Date.now = () => now
+  t.after(() => { Date.now = originalDateNow })
+
+  const deps = fixtures()
+  let roomCalls = 0
+  let realtimeCalls = 0
+  let queryStarted = deferred()
+  let queryGate = deferred()
+  deps.database.getRoom = async id => {
+    roomCalls += 1
+    return { id }
+  }
+  deps.database.realtimeTopMessages = async () => {
+    realtimeCalls += 1
+    queryStarted.resolve()
+    await queryGate.promise
+    return []
+  }
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const url = '/api/v1/analytics/realtime-top-messages?room_id=room-1'
+  const injectMany = subnet => Promise.all(Array.from({ length: 100 }, (_, index) => app.inject({
+    url,
+    remoteAddress: `198.51.${subnet}.${index + 1}`
+  })))
+
+  const coldResponsesPromise = injectMany(100)
+  await queryStarted.promise
+  assert.equal(realtimeCalls, 1)
+  assert.equal(roomCalls, 1)
+  queryGate.resolve()
+  const coldResponses = await coldResponsesPromise
+  assert.ok(coldResponses.every(response => response.statusCode === 200))
+
+  now += 4_999
+  assert.equal((await app.inject({ url, remoteAddress: '192.0.2.1' })).statusCode, 200)
+  assert.equal(realtimeCalls, 1)
+  assert.equal(roomCalls, 1)
+
+  now += 1
+  queryStarted = deferred()
+  queryGate = deferred()
+  const expiredResponsesPromise = injectMany(101)
+  await queryStarted.promise
+  assert.equal(realtimeCalls, 2)
+  assert.equal(roomCalls, 2)
+  queryGate.resolve()
+  const expiredResponses = await expiredResponsesPromise
+  assert.ok(expiredResponses.every(response => response.statusCode === 200))
+  assert.equal(realtimeCalls, 2)
+  assert.equal(roomCalls, 2)
+})
+
+test('实时 Top API 的 TTL 从成功写入缓存时开始计算', async t => {
+  const originalDateNow = Date.now
+  let now = Date.parse('2026-09-22T00:00:00.000Z')
+  Date.now = () => now
+  t.after(() => { Date.now = originalDateNow })
+
+  const deps = fixtures()
+  let realtimeCalls = 0
+  const queryStarted = deferred()
+  const queryGate = deferred()
+  deps.database.getRoom = async id => ({ id })
+  deps.database.realtimeTopMessages = async () => {
+    realtimeCalls += 1
+    queryStarted.resolve()
+    await queryGate.promise
+    return []
+  }
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const url = '/api/v1/analytics/realtime-top-messages?room_id=room-1'
+
+  const responsePromise = app.inject(url)
+  await queryStarted.promise
+  now += 60_000
+  queryGate.resolve()
+  assert.equal((await responsePromise).statusCode, 200)
+
+  now += 4_999
+  assert.equal((await app.inject(url)).statusCode, 200)
+  assert.equal(realtimeCalls, 1)
+  now += 1
+  assert.equal((await app.inject(url)).statusCode, 200)
+  assert.equal(realtimeCalls, 2)
+})
+
+test('实时 Top API 并发失败共享单次查询且清理 pending 后可以重试', async t => {
+  const deps = fixtures()
+  let roomCalls = 0
+  let realtimeCalls = 0
+  const queryStarted = deferred()
+  const queryGate = deferred()
+  deps.database.getRoom = async id => {
+    roomCalls += 1
+    return { id }
+  }
+  deps.database.realtimeTopMessages = async () => {
+    realtimeCalls += 1
+    if (realtimeCalls === 1) {
+      queryStarted.resolve()
+      await queryGate.promise
+      throw new Error('query failed')
+    }
+    return []
+  }
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const url = '/api/v1/analytics/realtime-top-messages?room_id=room-1'
+  const failedResponsesPromise = Promise.all(Array.from({ length: 100 }, (_, index) => app.inject({
+    url,
+    remoteAddress: `203.0.113.${index + 1}`
+  })))
+
+  await queryStarted.promise
+  assert.equal(realtimeCalls, 1)
+  assert.equal(roomCalls, 1)
+  queryGate.resolve()
+  const failedResponses = await failedResponsesPromise
+  assert.ok(failedResponses.every(response => response.statusCode === 500))
+  assert.equal(realtimeCalls, 1)
+  assert.equal(roomCalls, 1)
+
+  const retry = await app.inject({ url, remoteAddress: '192.0.2.2' })
+  assert.equal(retry.statusCode, 200)
+  assert.equal(realtimeCalls, 2)
+  assert.equal(roomCalls, 2)
+})
+
+test('实时 Top API 并发房间不存在不缓存 404 且清理 pending', async t => {
+  const deps = fixtures()
+  let roomCalls = 0
+  let roomExists = false
+  const roomLookupStarted = deferred()
+  const roomLookupGate = deferred()
+  deps.database.getRoom = async id => {
+    roomCalls += 1
+    if (roomCalls === 1) {
+      roomLookupStarted.resolve()
+      await roomLookupGate.promise
+    }
+    return roomExists ? { id } : null
+  }
+  deps.database.realtimeTopMessages = async () => []
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const url = '/api/v1/analytics/realtime-top-messages?room_id=room-1'
+  const failedResponsesPromise = Promise.all(Array.from({ length: 100 }, (_, index) => app.inject({
+    url,
+    remoteAddress: `198.51.102.${index + 1}`
+  })))
+
+  await roomLookupStarted.promise
+  assert.equal(roomCalls, 1)
+  roomLookupGate.resolve()
+  const failedResponses = await failedResponsesPromise
+  assert.ok(failedResponses.every(response => response.statusCode === 404))
+
+  roomExists = true
+  const retry = await app.inject({ url, remoteAddress: '192.0.2.3' })
+  assert.equal(retry.statusCode, 200)
+  assert.equal(roomCalls, 2)
+})
+
+test('实时 Top API 不同 cacheKey 的 single-flight 可以独立执行', async t => {
+  const deps = fixtures()
+  const started = new Map([
+    ['room-a', deferred()],
+    ['room-b', deferred()]
+  ])
+  const gates = new Map([
+    ['room-a', deferred()],
+    ['room-b', deferred()]
+  ])
+  const calls = new Map()
+  deps.database.getRoom = async id => ({ id })
+  deps.database.realtimeTopMessages = async ({ roomId }) => {
+    calls.set(roomId, (calls.get(roomId) || 0) + 1)
+    started.get(roomId).resolve()
+    await gates.get(roomId).promise
+    return []
+  }
+  const app = buildApp(deps)
+  t.after(() => app.close())
+
+  const responsesPromise = Promise.all([
+    app.inject({
+      url: '/api/v1/analytics/realtime-top-messages?room_id=room-a',
+      remoteAddress: '192.0.2.10'
+    }),
+    app.inject({
+      url: '/api/v1/analytics/realtime-top-messages?room_id=room-b',
+      remoteAddress: '192.0.2.11'
+    })
+  ])
+  await Promise.all([...started.values()].map(item => item.promise))
+  assert.deepEqual(Object.fromEntries(calls), { 'room-a': 1, 'room-b': 1 })
+  for (const gate of gates.values()) gate.resolve()
+  const responses = await responsesPromise
+  assert.ok(responses.every(response => response.statusCode === 200))
+})
+
+test('实时 Top API 同 IP 并发仍执行 60/min 限流且只查询数据库一次', async t => {
+  const deps = fixtures()
+  let realtimeCalls = 0
+  const queryStarted = deferred()
+  const queryGate = deferred()
+  deps.database.getRoom = async id => ({ id })
+  deps.database.realtimeTopMessages = async () => {
+    realtimeCalls += 1
+    queryStarted.resolve()
+    await queryGate.promise
+    return []
+  }
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const url = '/api/v1/analytics/realtime-top-messages?room_id=room-1'
+  const responsesPromise = Promise.all(Array.from({ length: 100 }, () => app.inject({
+    url,
+    remoteAddress: '203.0.113.200'
+  })))
+
+  await queryStarted.promise
+  assert.equal(realtimeCalls, 1)
+  queryGate.resolve()
+  const responses = await responsesPromise
+  assert.equal(responses.filter(response => response.statusCode === 200).length, 60)
+  assert.equal(responses.filter(response => response.statusCode === 429).length, 40)
+  assert.equal(realtimeCalls, 1)
 })
 
 test('实时 Top API 校验窗口、limit、时区和房间', async t => {

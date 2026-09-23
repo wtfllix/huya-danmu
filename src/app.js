@@ -3,10 +3,15 @@ const Fastify = require('fastify')
 const fastifyStatic = require('@fastify/static')
 const { clampLimit, parseDate } = require('./utils')
 const { parseWindowQuery, createWindowTopService } = require('./services/window-top-service')
+const { RealtimeEventBus } = require('./services/realtime-event-bus')
 
-function buildApp({ config, database, detector, supervisor, spool, storage, archives, loggerOptions } = {}) {
+const REALTIME_TOP_CACHE_TTL_MS = 5_000
+
+function buildApp({ config, database, detector, supervisor, spool, storage, archives, eventBus, loggerOptions } = {}) {
   const app = Fastify({ logger: loggerOptions || { level: config.logLevel } })
+  const realtimeEventBus = eventBus || new RealtimeEventBus({ ringSize: config.realtimeRingSize || 3000 })
   const realtimeTopCache = new Map()
+  const realtimeTopPending = new Map()
   const sessionTopCache = new Map()
   const getWindowTop = createWindowTopService(database)
 
@@ -112,7 +117,9 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
     for (const room of rooms) statuses.set(room.runtime_status, (statuses.get(room.runtime_status) || 0) + 1)
     for (const [status, count] of statuses) lines.push(`huya_rooms{status="${status}"} ${count}`)
     lines.push('# HELP huya_collector_messages_total Huya events received by type', '# TYPE huya_collector_messages_total counter')
-    for (const type of ['chat', 'gift', 'online']) lines.push(`huya_collector_messages_total{type="${type}"} ${supervisor.metrics?.[type] || 0}`)
+    for (const type of ['chat', 'gift', 'paid_message_snapshot', 'online']) {
+      lines.push(`huya_collector_messages_total{type="${type}"} ${supervisor.metrics?.[type] || 0}`)
+    }
     lines.push('# HELP huya_collector_errors_total Collector errors', '# TYPE huya_collector_errors_total counter')
     lines.push(`huya_collector_errors_total{type="connection"} ${supervisor.metrics?.errors || 0}`)
     lines.push(`huya_collector_errors_total{type="parse"} ${supervisor.metrics?.parseErrors || 0}`)
@@ -192,6 +199,67 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
     })
   })
 
+  app.get('/api/v1/rooms/:id/events', async (request, reply) => {
+    reply.hijack()
+    const response = reply.raw
+    const roomId = String(request.params.id)
+    const lastEventId = request.headers['last-event-id']
+    let closed = false
+    let unsubscribe = () => {}
+    let heartbeat = null
+
+    const close = () => {
+      if (closed) return
+      closed = true
+      clearInterval(heartbeat)
+      unsubscribe()
+      if (!response.destroyed) response.end()
+    }
+    const write = chunk => {
+      if (closed || response.destroyed || response.writableEnded) return false
+      try {
+        response.write(chunk)
+        return true
+      } catch (_) {
+        close()
+        return false
+      }
+    }
+    const writeEvent = event => {
+      if (!event) return
+      const payload = event.event_type === 'paid_message_snapshot'
+        ? { event_type: 'paid_message_snapshot', items: event.items || [] }
+        : event
+      write(`id: ${event.event_id}\nevent: ${event.event_type}\ndata: ${JSON.stringify(payload)}\n\n`)
+    }
+
+    response.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    })
+    response.flushHeaders?.()
+    request.raw.on('close', close)
+    response.on('close', close)
+    response.on('error', close)
+    unsubscribe = realtimeEventBus.subscribe(roomId, writeEvent)
+
+    if (lastEventId) {
+      const replay = realtimeEventBus.getSince(roomId, String(lastEventId))
+      if (replay === null) write('event: reset\ndata: {"reason":"buffer_miss"}\n\n')
+      else for (const event of replay) writeEvent(event)
+    }
+    const current = realtimeEventBus.getCurrentPaidSnapshot(roomId)
+    if (current && (!lastEventId || current.event_id !== String(lastEventId))) {
+      const replay = lastEventId ? realtimeEventBus.getSince(roomId, String(lastEventId)) : []
+      if (!replay || !replay.some(event => event.event_id === current.event_id)) writeEvent(current)
+    }
+    heartbeat = setInterval(() => write(': heartbeat\n\n'), 15_000)
+    heartbeat.unref?.()
+    return reply
+  })
+
   app.get('/api/v1/rooms/:id/messages.csv', async (request, reply) => {
     const query = request.query
     const stream = await database.messageCsvStream({
@@ -250,19 +318,31 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
     if (cached && cached.expiresAt > Date.now()) return cached.value
     if (cached) realtimeTopCache.delete(cacheKey)
 
-    if (!database.ready) throw analyticsError('数据源暂不可用', 'DATA_SOURCE_UNAVAILABLE', 503)
-    const room = await database.getRoom(roomId)
-    if (!room) throw analyticsError('房间不存在', 'ROOM_NOT_FOUND', 404)
+    const existingPending = realtimeTopPending.get(cacheKey)
+    if (existingPending) return await existingPending
 
-    const resultWindows = await database.realtimeTopMessages({ roomId, windows, at, limit })
-    const value = {
-      room_id: roomId,
-      as_of: at.toISOString(),
-      generated_at: new Date().toISOString(),
-      windows: resultWindows
+    const pending = (async () => {
+      if (!database.ready) throw analyticsError('数据源暂不可用', 'DATA_SOURCE_UNAVAILABLE', 503)
+      const room = await database.getRoom(roomId)
+      if (!room) throw analyticsError('房间不存在', 'ROOM_NOT_FOUND', 404)
+
+      const resultWindows = await database.realtimeTopMessages({ roomId, windows, at, limit })
+      const value = {
+        room_id: roomId,
+        as_of: at.toISOString(),
+        generated_at: new Date().toISOString(),
+        windows: resultWindows
+      }
+      setCacheEntry(realtimeTopCache, cacheKey, value, REALTIME_TOP_CACHE_TTL_MS)
+      return value
+    })()
+    realtimeTopPending.set(cacheKey, pending)
+
+    try {
+      return await pending
+    } finally {
+      if (realtimeTopPending.get(cacheKey) === pending) realtimeTopPending.delete(cacheKey)
     }
-    setCacheEntry(realtimeTopCache, cacheKey, value, 12000)
-    return value
   })
 
   app.get('/api/v1/analytics/session-top-messages', async request => {
