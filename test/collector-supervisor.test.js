@@ -197,6 +197,8 @@ function lifecycleFixture(t, detector) {
   const database = Object.create(Database.prototype)
   // Exercise the real authority write methods; capture the JSONB merge payload.
   database.query = async (sql, params) => {
+    if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return { rows: [] }
+    if (sql.includes('SELECT * FROM rooms')) return { rows: [room] }
     if (sql.includes('last_checked_at = $4')) {
       room.last_checked_at = params[3]
       Object.assign(room.metadata, params[4])
@@ -209,6 +211,7 @@ function lifecycleFixture(t, detector) {
     } else assert.fail(`unexpected query: ${sql}`)
     return { rows: [] }
   }
+  database.pool = { connect: async () => ({ query: database.query, release() {} }) }
   database.listRooms = async () => [room]
   database.getActiveSession = async () => session.status === 'active' ? session : null
   database.endSession = async (_roomId, status) => { ends.push(status); session.status = status }
@@ -364,4 +367,22 @@ test('停服时正在复核 OFFLINE 的孤儿 session 不被错误 completed', a
   assert.equal(session.status, 'active')
   assert.deepEqual(ends, [])
   assert.equal(room.metadata.liveStatusState, 'unknown')
+})
+
+test('场次改变重建 collector，迟到的旧连接消息不会进入新场次', async t => {
+  const { supervisor, database, room } = lifecycleFixture(t, { detect: async () => detection() })
+  await supervisor.checkRoom(room)
+  const state = supervisor.runtime.get(room.id)
+  const oldClient = state.client
+  const next = { id: 'new-session', status: 'active' }
+  database.startSession = async () => next
+  const messages = []
+  t.mock.method(supervisor, 'onMessage', async (_room, session) => messages.push(session.id))
+  await supervisor.checkRoom(room)
+  assert.notEqual(state.client, oldClient)
+  assert.equal(state.session, next)
+  oldClient.emit('message', {})
+  state.client.emit('message', {})
+  assert.deepEqual(messages, ['new-session'])
+  await supervisor.stop()
 })

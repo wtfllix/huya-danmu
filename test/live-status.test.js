@@ -33,3 +33,13 @@ test('缺数据、无效时间、未来观察、状态冲突以及显式失败�
   }
   assert.equal(roomLiveStatus({}).status, 'unknown')
 })
+
+test('直播状态和场次标识来自同一个持久观察，UNKNOWN 保留可展示的场次', () => {
+  const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const room = { metadata: { liveSessionId: id, liveStatus: 2, liveStatusState: 'live', liveStatusObservedAt: observedAt } }
+  assert.equal(roomLiveStatus(room, 60_000, t0).live_session_id, id)
+  room.metadata.liveStatusState = 'unknown'
+  assert.equal(roomLiveStatus(room, 60_000, t0).live_session_id, id)
+  room.metadata.liveSessionId = 'invalid'
+  assert.equal(roomLiveStatus(room, 60_000, t0).live_session_id, null)
+})

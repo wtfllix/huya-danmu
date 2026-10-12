@@ -58,7 +58,7 @@ test('已有 active session 缺平台时间可补齐，非 NULL 时间不覆盖�
   assert.equal(updates, 0)
   assert.equal(await database.startSession('room', { liveStartedAt }), active)
   assert.equal(updates, 1)
-  assert.equal(await database.startSession('room', { liveStartedAt: observedAt }), active)
+  assert.equal(await database.startSession('room', { liveStartedAt }), active)
   assert.equal(active.platform_started_at, liveStartedAt)
   assert.equal(updates, 1)
 })
@@ -73,4 +73,54 @@ test('session 不使用无效时间或 detected start 作为平台时间', async
   for (const liveStartedAt of [null, undefined, 'invalid', '2026-02-30T00:00:00.000Z']) {
     await database.startSession('room', { liveStartedAt })
   }
+})
+
+test('更晚的平台开播时间结束遗留场次并生成新 UUID，旧时间不使场次倒退', async () => {
+  const database = Object.create(Database.prototype)
+  const active = { id: 'old-session', platform_started_at: new Date(liveStartedAt) }
+  database.getActiveSession = async () => active
+  const calls = []
+  database.query = async (sql, params) => {
+    calls.push({ sql, params })
+    return { rows: [{ id: params[0], platform_started_at: params[3] }] }
+  }
+  const next = await database.startSession('room', { liveStartedAt: observedAt })
+  assert.notEqual(next.id, active.id)
+  assert.equal(next.platform_started_at, observedAt)
+  assert.match(calls[0].sql, /status = 'interrupted'/)
+  assert.doesNotMatch(calls[0].sql, /platform_ended_at/)
+  assert.match(calls[1].sql, /INSERT INTO live_sessions/)
+  calls.length = 0
+  assert.equal(await database.startSession('room', { liveStartedAt }), active)
+  assert.equal(await database.startSession('room', { liveStartedAt: '2026-10-10T06:00:00.000Z' }), active)
+  assert.equal(calls.length, 0)
+})
+
+test('场次与 authority 在房间锁下同事务提交，写入失败回滚', async () => {
+  const database = Object.create(Database.prototype)
+  const calls = []
+  let fail = false
+  let released = 0
+  const client = { release() { released++ }, query: async (sql, params) => {
+    calls.push({ sql, params })
+    if (sql.includes('SELECT * FROM rooms')) return { rows: [{ id: 'room', last_checked_at: null }] }
+    if (sql.includes('last_checked_at = $4') && fail) throw new Error('observation failed')
+    return { rows: [] }
+  } }
+  database.pool = { connect: async () => client }
+  database.startSession = async (_id, _metadata, connection) => {
+    assert.equal(connection, client)
+    return { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }
+  }
+  const result = { status: 'live', checkedAt: observedAt, metadata: { liveStatus: 2 } }
+  assert.equal((await database.recordLiveObservation('room', result)).id, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+  assert.equal(calls[0].sql, 'BEGIN')
+  assert.match(calls[1].sql, /FOR UPDATE/)
+  assert.equal(calls[2].params[4].liveSessionId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+  assert.equal(calls[3].sql, 'COMMIT')
+  calls.length = 0
+  fail = true
+  await assert.rejects(database.recordLiveObservation('room', result), /observation failed/)
+  assert.equal(calls.at(-1).sql, 'ROLLBACK')
+  assert.equal(released, 2)
 })

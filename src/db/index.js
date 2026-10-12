@@ -169,10 +169,10 @@ class Database {
     }
   }
 
-  async recordStatusCheck(roomId, result) {
+  async recordStatusCheck(roomId, result, liveSessionId, client = this) {
     const observedAt = validIsoTime(result.checkedAt)
     if (!observedAt || !['live', 'offline'].includes(result.status)) throw new Error('无效的平台状态观察')
-    await this.query(
+    await client.query(
       `UPDATE rooms SET anchor_uid = COALESCE($2, anchor_uid), anchor_name = COALESCE($3, anchor_name),
        last_checked_at = $4, metadata = metadata || $5::jsonb, last_error = NULL, updated_at = now()
        WHERE id = $1`,
@@ -180,9 +180,33 @@ class Database {
         ...result.metadata,
         liveStatusState: result.status,
         liveStatusObservedAt: observedAt,
+        ...(liveSessionId === undefined ? {} : { liveSessionId }),
         liveStartedAt: result.status === 'live' ? validIsoTime(result.metadata?.liveStartedAt) : null
       }]
     )
+  }
+
+  async recordLiveObservation(roomId, result) {
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      const { rows } = await client.query('SELECT * FROM rooms WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [roomId])
+      if (!rows[0]) throw new Error('房间不存在')
+      if (!validIsoTime(result.checkedAt) || (rows[0].last_checked_at && new Date(rows[0].last_checked_at) > new Date(result.checkedAt))) {
+        throw new Error('无效或过期的平台状态观察')
+      }
+      const session = result.status === 'live'
+        ? await this.startSession(roomId, result.metadata, client)
+        : await this.getActiveSession(roomId, client)
+      await this.recordStatusCheck(roomId, result, session?.id, client)
+      await client.query('COMMIT')
+      return session
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
   }
 
   async recordLiveStatusFailure(roomId) {
@@ -201,27 +225,34 @@ class Database {
     )
   }
 
-  async getActiveSession(roomId) {
-    const { rows } = await this.query(
+  async getActiveSession(roomId, client = this) {
+    const { rows } = await client.query(
       `SELECT * FROM live_sessions WHERE room_id = $1 AND status = 'active' ORDER BY detected_started_at DESC LIMIT 1`,
       [roomId]
     )
     return rows[0] || null
   }
 
-  async startSession(roomId, metadata = {}) {
+  async startSession(roomId, metadata = {}, client = this) {
     const platformStartedAt = validIsoTime(metadata.liveStartedAt)
-    const active = await this.getActiveSession(roomId)
+    let active = await this.getActiveSession(roomId, client)
+    if (active?.platform_started_at && platformStartedAt
+      && new Date(active.platform_started_at).getTime() < Date.parse(platformStartedAt)) {
+      // A restart or a missed OFFLINE poll can leave the preceding broadcast active.
+      await client.query(`UPDATE live_sessions SET status = 'interrupted', detected_ended_at = now(), updated_at = now()
+        WHERE id = $1 AND status = 'active'`, [active.id])
+      active = null
+    }
     if (active) {
       if (active.platform_started_at || !platformStartedAt) return active
-      const { rows } = await this.query(
+      const { rows } = await client.query(
         `UPDATE live_sessions SET platform_started_at = COALESCE(platform_started_at, $2::timestamptz),
          metadata = metadata || $3::jsonb, updated_at = now() WHERE id = $1 RETURNING *`,
         [active.id, platformStartedAt, metadata]
       )
       return rows[0]
     }
-    const { rows } = await this.query(
+    const { rows } = await client.query(
       `INSERT INTO live_sessions(id, room_id, detected_started_at, status, metadata, platform_started_at)
        VALUES ($1, $2, now(), 'active', $3, $4) RETURNING *`,
       [crypto.randomUUID(), roomId, metadata, platformStartedAt]

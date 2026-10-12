@@ -36,6 +36,8 @@ function roomLiveStatus(room, pollIntervalMs = 60_000, now = Date.now()) {
     observed_at: observedAt,
     valid_until: validUntil,
     live_started_at: status === 'live' ? validIsoTime(metadata.liveStartedAt) : null,
+    live_session_id: typeof metadata.liveSessionId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(metadata.liveSessionId)
+      ? metadata.liveSessionId : null,
     source: LIVE_STATUS_SOURCE
   }
 }

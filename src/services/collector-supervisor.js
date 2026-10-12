@@ -116,14 +116,20 @@ class CollectorSupervisor {
         throw error
       }
       if (state.cancelled) return
-      await this.database.recordStatusCheck(room.id, result)
+      const observedSession = await this.database.recordLiveObservation(room.id, result)
       if (state.cancelled) return
       if (result.status === 'live') {
         state.offlineCount = 0
+        if (state.client && state.session?.id !== observedSession?.id) {
+          const previousClient = state.client
+          state.client = null
+          state.ready = false
+          previousClient.stop()
+        }
         if (!state.client) await this.startCollector(room, result, state)
         else {
           // A later successful poll may supply the platform start missing on the first poll.
-          state.session = await this.database.startSession(room.id, result.metadata)
+          state.session = observedSession
           if (!state.cancelled && state.ready) await this.database.setRoomStatus(room.id, 'listening', { error: null })
         }
       } else {
@@ -175,7 +181,9 @@ class CollectorSupervisor {
       this.database.setRoomStatus(room.id, 'listening', { reason: 'subscription_ready', error: null })
         .catch(error => this.logger.error?.({ error, roomId: room.id }, '更新监听状态失败'))
     })
-    client.on('message', message => this.onMessage(room, session, message))
+    client.on('message', message => {
+      if (!state.cancelled && state.client === client) return this.onMessage(room, session, message)
+    })
     client.on('parseError', ({ uri, error, payloadLength, offset, tag, type, bufferLength, remainingBytes, expectedReadBytes }) => {
       this.metrics.parseErrors += 1
       this.logger.warn?.({

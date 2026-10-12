@@ -128,6 +128,7 @@ Authorization: Bearer <ADMIN_API_TOKEN>
   "observed_at": "2026-10-10T08:42:20.000Z",
   "valid_until": "2026-10-10T08:44:20.000Z",
   "live_started_at": "2026-10-10T07:15:00.000Z",
+  "live_session_id": "<internal live session uuid>",
   "source": "m.huya.com:HNF_GLOBAL_INIT"
 }
 ```
@@ -141,6 +142,10 @@ Authorization: Bearer <ADMIN_API_TOKEN>
 `runtime_status` 仍仅表示 collector 状态，即使它是 `listening`，本接口也可能返回 `offline` 或 `unknown`。一次成功 OFFLINE 即更新本接口；collector / session 仍需连续 `OFFLINE_CONFIRMATIONS` 次成功 OFFLINE 才停止，失败打断连续确认且不结束场次。服务启动在开放 HTTP 前先置 UNKNOWN，再重新检测：LIVE 复用 active session，OFFLINE 最终纠正孤儿 session，失败保持待复核。服务停止取消并等待在途检查、置 UNKNOWN，保留 active session，不写 completed 或下播时间；手动禁用 collector 将场次标记 interrupted。
 
 默认轮询仍为 60 秒。平台页面已更新且请求成功时，发现开播/下播通常最多约 60 秒加本次请求耗时（detector 超时为 15 秒）；collector / session 两次 OFFLINE 确认通常最多约 120 秒加请求耗时。平台页面自身延迟或连续请求失败时无法保证该上限，此时返回 UNKNOWN。
+
+`live_session_id` 对应 `live_sessions.id`，未知或尚无确认场次时为 null。成功检测在房间行锁下，同一事务创建/复用直播场次并写入 `liveStatus`、`liveStatusState`、`liveStatusObservedAt`、`liveSessionId`；接口只读取该持久快照。失败和暂时 UNKNOWN 保留最后确认 UUID，不伪造新场次。平台开播时间比 active 场次更晚时，将旧场次标记 interrupted 并创建新 UUID；相同、缺失或更早的时间不会使 UUID 倒退。collector 随换场重连，丢弃旧连接的迟到消息。
+
+此字段会改变 strict 客户端的响应 schema。发布时先升级主站兼容解析与本场统计迁移，再升级监听器；主站新版本允许缺少此字段，旧版本不能直接接收新增字段。
 
 ### 实时短窗口 Top 榜
 

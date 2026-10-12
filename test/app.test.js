@@ -64,7 +64,7 @@ test('live-status 只读共享平台 authority，忽略 runtime 且不缓存', a
   assert.deepEqual(fresh.json(), {
     room_id: 'room-1', external_room_id: '116864', status: 'live',
     observed_at: observedAt, valid_until: '2026-10-10T08:44:20.000Z',
-    live_started_at: '2026-10-10T07:15:00.000Z', source: 'm.huya.com:HNF_GLOBAL_INIT'
+    live_started_at: '2026-10-10T07:15:00.000Z', live_session_id: null, source: 'm.huya.com:HNF_GLOBAL_INIT'
   })
   for (const [patch, status] of [
     [{ liveStatusState: 'offline', liveStatus: 3 }, 'offline'],
