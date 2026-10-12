@@ -63,10 +63,11 @@ async function main() {
   })
   const app = buildApp({ config, database, detector, supervisor, spool, storage, archives, eventBus })
 
+  // Invalidate old authority before exposing HTTP after a process restart.
+  await startupPhase('collector started', () => supervisor.start())
   const address = await startupPhase('http server listen',
     () => app.listen({ host: config.host, port: config.port }))
   console.info(`http server listening: ${address}`)
-  await startupPhase('collector started', () => supervisor.start())
   const sampleStorage = async () => {
     const samples = await storage.sample()
     if (samples.some(item => ['high', 'critical'].includes(item.status))) {

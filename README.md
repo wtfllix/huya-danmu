@@ -87,6 +87,7 @@ Compose 创建三个持久卷：
 
 ```text
 GET    /api/v1/rooms
+GET    /api/v1/rooms/:id/live-status
 POST   /api/v1/rooms
 PATCH  /api/v1/rooms/:id
 DELETE /api/v1/rooms/:id
@@ -114,6 +115,32 @@ GET    /metrics
 ```text
 Authorization: Bearer <ADMIN_API_TOKEN>
 ```
+
+### 当前平台直播状态
+
+`GET /api/v1/rooms/:id/live-status` 使用内部 room UUID，仅读取已持久化的虎牙页面观察，不请求虎牙、不启动 collector、不修改房间。不存在的房间返回现有格式的 404；沿用上述 API 令牌认证。响应不含 collector 内部信息、错误详情或完整 metadata，使用 `Cache-Control: no-store`，无额外进程缓存。
+
+```json
+{
+  "room_id": "<internal room uuid>",
+  "external_room_id": "116864",
+  "status": "live",
+  "observed_at": "2026-10-10T08:42:20.000Z",
+  "valid_until": "2026-10-10T08:44:20.000Z",
+  "live_started_at": "2026-10-10T07:15:00.000Z",
+  "source": "m.huya.com:HNF_GLOBAL_INIT"
+}
+```
+
+状态 authority 仅来自 `roomInfo.eLiveStatus`：成功解析的非负安全整数（或纯数字字符串）中，`2` 为 `live`，其他值为 `offline`；已观察的 `1` / `3` 不推断更细的业务语义。缺失、null、空字符串、布尔值、NaN 或其他无法可靠解析的值均作为检测失败处理。HTTP 错误、超时、缺失 `HNF_GLOBAL_INIT`、无效 JSON 等失败立即将 authority 写成 `unknown`，保留最后成功的原始值和观察时间供诊断。不会因为 `lLiveChannel > 0` 回退到 LIVE，也不会用 channel 为 0 证明 OFFLINE。
+
+成功状态存入 `rooms.metadata` 的 `liveStatus`、`liveStatusState`、`liveStatusObservedAt`、`liveStartedAt`、`liveChannel`。`liveStatusObservedAt` 是响应读取和解析成功后的服务器 UTC 时间，`last_checked_at` 仍为最后成功检测时间。`valid_until = observed_at + 2 × LIVE_POLL_INTERVAL_SECONDS`；在截止时间瞬间仍有效，超过截止时间、缺少有效观察时间或缺少明确 authority 均返回 `unknown`。没有成功观察时两个时间字段为 null；失败或过期时仍可返回最后成功观察及其截止时间。只有有效 LIVE 才返回可靠的 `live_started_at`，其他情况为 null。调用方只依赖 `status`，UNKNOWN 不能等同于平台确认下播。
+
+平台开播时间来自 `tLiveInfo.iStartTime`（Unix seconds），不使用 detected start 替代。有效时间写入新 session 的 `platform_started_at`，已有 active session 仅在该字段为 NULL 时补齐。正确读取 `tLiveInfo.lLiveChannel`；不读取或暴露可能被 JSON.parse 舍入的 `lLiveId`。没有可靠平台下播时间，`platform_ended_at` 保持 NULL。
+
+`runtime_status` 仍仅表示 collector 状态，即使它是 `listening`，本接口也可能返回 `offline` 或 `unknown`。一次成功 OFFLINE 即更新本接口；collector / session 仍需连续 `OFFLINE_CONFIRMATIONS` 次成功 OFFLINE 才停止，失败打断连续确认且不结束场次。服务启动在开放 HTTP 前先置 UNKNOWN，再重新检测：LIVE 复用 active session，OFFLINE 最终纠正孤儿 session，失败保持待复核。服务停止取消并等待在途检查、置 UNKNOWN，保留 active session，不写 completed 或下播时间；手动禁用 collector 将场次标记 interrupted。
+
+默认轮询仍为 60 秒。平台页面已更新且请求成功时，发现开播/下播通常最多约 60 秒加本次请求耗时（detector 超时为 15 秒）；collector / session 两次 OFFLINE 确认通常最多约 120 秒加请求耗时。平台页面自身延迟或连续请求失败时无法保证该上限，此时返回 UNKNOWN。
 
 ### 实时短窗口 Top 榜
 

@@ -35,6 +35,74 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
+test('live-status 只读共享平台 authority，忽略 runtime 且不缓存', async t => {
+  const deps = fixtures()
+  const observedAt = '2026-10-10T08:42:20.000Z'
+  const now = Date.parse(observedAt) + 30_000
+  t.mock.method(Date, 'now', () => now)
+  deps.config.pollIntervalMs = 60_000
+  const room = {
+    id: 'room-1', external_room_id: '116864', runtime_status: 'listening',
+    last_error: { message: 'private' }, metadata: {
+      liveStatus: 2, liveStatusState: 'live', liveStatusObservedAt: observedAt,
+      liveStartedAt: '2026-10-10T07:15:00.000Z', title: 'private'
+    }
+  }
+  let reads = 0
+  deps.database.getRoom = async id => { reads += 1; return id === room.id ? room : null }
+  for (const [object, method] of [[deps.detector, 'detect'], [deps.supervisor, 'checkRoom'],
+    [deps.supervisor, 'tick'], [deps.supervisor, 'stopCollector']]) {
+    object[method] = async () => assert.fail(`${method} must not be called`)
+  }
+  deps.database.updateRoom = async () => assert.fail('must not write room')
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const url = '/api/v1/rooms/room-1/live-status'
+  const fresh = await app.inject(url)
+  assert.equal(fresh.statusCode, 200)
+  assert.equal(fresh.headers['cache-control'], 'no-store')
+  assert.deepEqual(fresh.json(), {
+    room_id: 'room-1', external_room_id: '116864', status: 'live',
+    observed_at: observedAt, valid_until: '2026-10-10T08:44:20.000Z',
+    live_started_at: '2026-10-10T07:15:00.000Z', source: 'm.huya.com:HNF_GLOBAL_INIT'
+  })
+  for (const [patch, status] of [
+    [{ liveStatusState: 'offline', liveStatus: 3 }, 'offline'],
+    [{ liveStatusState: 'unknown', liveStatus: 2 }, 'unknown'],
+    [{ liveStatusState: 'live', liveStatus: 2, liveStatusObservedAt: '2026-10-10T08:40:48.000Z' }, 'unknown'],
+    [{ liveStatusObservedAt: undefined }, 'unknown']
+  ]) {
+    Object.assign(room.metadata, patch)
+    const response = await app.inject(url)
+    assert.equal(response.statusCode, 200)
+    assert.equal(response.json().status, status)
+    assert.equal(response.json().live_started_at, null)
+  }
+  assert.equal(reads, 5)
+  room.runtime_status = 'degraded'
+  room.metadata = { liveStatus: 2, liveStatusState: 'unknown', liveStatusObservedAt: observedAt }
+  assert.equal((await app.inject(url)).json().status, 'unknown')
+  room.metadata = {}
+  const missing = (await app.inject(url)).json()
+  assert.equal(missing.status, 'unknown')
+  assert.equal(missing.observed_at, null)
+  assert.equal(missing.valid_until, null)
+  const absent = await app.inject('/api/v1/rooms/absent/live-status')
+  assert.equal(absent.statusCode, 404)
+  assert.deepEqual(absent.json(), { error: '房间不存在', code: 'REQUEST_FAILED' })
+})
+
+test('live-status 沿用现有 API token 认证', async t => {
+  const deps = fixtures()
+  deps.config.apiToken = 'test-token'
+  deps.database.getRoom = async id => ({ id, external_room_id: '1', metadata: {} })
+  const app = buildApp(deps)
+  t.after(() => app.close())
+  const url = '/api/v1/rooms/room-1/live-status'
+  assert.equal((await app.inject(url)).statusCode, 401)
+  assert.equal((await app.inject({ url, headers: { authorization: 'Bearer test-token' } })).statusCode, 200)
+})
+
 test('batch windows validates parameters and does not cache repaired data', async t => {
   const deps = fixtures()
   deps.database.getRoom = async () => ({ id: 'room-1' })

@@ -3,6 +3,10 @@ const assert = require('node:assert/strict')
 
 const { CollectorSupervisor, restoreSnapshotPayload } = require('../src/services/collector-supervisor')
 const { RealtimeEventBus } = require('../src/services/realtime-event-bus')
+const HuyaDanmu = require('../index')
+const { HuyaStatusDetector } = require('../src/huya/status-detector')
+const { Database } = require('../src/db')
+const { roomLiveStatus } = require('../src/services/live-status')
 
 function createSupervisor() {
   const enqueued = []
@@ -179,4 +183,185 @@ test('upstream snapshot replaces restored state and remaining-only changes do no
     type: 'paid_message_snapshot', time: Date.now(), items: [upstreamItem('a', 234)]
   })
   assert.equal(published.length, 1)
+})
+
+function lifecycleFixture(t, detector) {
+  const room = {
+    id: 'room-1', external_room_id: '116864', enabled: true, runtime_status: 'listening',
+    last_checked_at: '2026-10-10T08:42:20.000Z', metadata: {
+      liveStatus: 2, liveStatusState: 'live', liveStatusObservedAt: '2026-10-10T08:42:20.000Z'
+    }
+  }
+  const session = { id: 'same-session', status: 'active', platform_started_at: null }
+  const ends = []
+  const database = Object.create(Database.prototype)
+  // Exercise the real authority write methods; capture the JSONB merge payload.
+  database.query = async (sql, params) => {
+    if (sql.includes('last_checked_at = $4')) {
+      room.last_checked_at = params[3]
+      Object.assign(room.metadata, params[4])
+    } else if (sql.includes('"liveStatusState":"unknown"')) {
+      room.metadata.liveStatusState = 'unknown'
+    } else if (sql.includes('UPDATE live_sessions')) {
+      assert.match(sql, /COALESCE\(platform_started_at/)
+      session.platform_started_at ||= params[1]
+      return { rows: [session] }
+    } else assert.fail(`unexpected query: ${sql}`)
+    return { rows: [] }
+  }
+  database.listRooms = async () => [room]
+  database.getActiveSession = async () => session.status === 'active' ? session : null
+  database.endSession = async (_roomId, status) => { ends.push(status); session.status = status }
+  database.setRoomStatus = async (_id, status) => { room.runtime_status = status }
+  const supervisor = new CollectorSupervisor({
+    database, detector, spool: {}, config: { pollIntervalMs: 60_000, offlineConfirmations: 2 }, logger: {}
+  })
+  // Keep the actual supervisor startCollector/session path without opening a socket.
+  t.mock.method(HuyaDanmu.prototype, 'start', async function () { this.emit('ready') })
+  return { supervisor, database, room, session, ends }
+}
+
+function detection(status = 'live', liveStartedAt = '2026-10-10T07:15:00.000Z') {
+  return {
+    status, checkedAt: '2026-10-10T08:42:20.000Z', source: 'm.huya.com:HNF_GLOBAL_INIT',
+    metadata: { liveStatus: status === 'live' ? 2 : 3, liveStartedAt }
+  }
+}
+
+test('重启检测 LIVE 复用 active session，补平台时间，停止服务不 completed', async t => {
+  const { supervisor, room, session, ends } = lifecycleFixture(t, { detect: async () => detection() })
+  await supervisor.start()
+  await supervisor.runtime.get(room.id).checkDone
+  const state = supervisor.runtime.get(room.id)
+  assert.equal(state.session.id, session.id)
+  assert.equal(session.platform_started_at, '2026-10-10T07:15:00.000Z')
+  assert.equal(room.metadata.liveStatusState, 'live')
+  assert.deepEqual(ends, [])
+  await supervisor.stop()
+  assert.equal(session.status, 'active')
+  assert.deepEqual(ends, [])
+  assert.equal(room.metadata.liveStatusState, 'unknown')
+  await supervisor.start()
+  await supervisor.runtime.get(room.id).checkDone
+  assert.equal(supervisor.runtime.get(room.id).session.id, session.id)
+  assert.deepEqual(ends, [])
+  await supervisor.stop()
+})
+
+test('重启 OFFLINE 第一次即更新 authority，第二次确认结束无 client 的孤儿 session', async t => {
+  const { supervisor, room, session, ends } = lifecycleFixture(t, { detect: async () => detection('offline') })
+  await supervisor.start()
+  await supervisor.runtime.get(room.id).checkDone
+  assert.equal(room.metadata.liveStatusState, 'offline')
+  assert.equal(room.metadata.liveStartedAt, null)
+  assert.equal(session.status, 'active')
+  assert.equal(room.runtime_status, 'stopping')
+  assert.deepEqual(ends, [])
+  await supervisor.checkRoom(room)
+  assert.deepEqual(ends, ['completed'])
+  assert.equal(supervisor.runtime.get(room.id).session, null)
+  await supervisor.stop()
+})
+
+const failedFetches = [
+  ['HTTP 503', async () => ({ ok: false, status: 503 })],
+  ['timeout', async () => { throw new DOMException('timed out', 'TimeoutError') }],
+  ['缺 HNF', async () => ({ ok: true, text: async () => '<html></html>' })],
+  ['invalid JSON', async () => ({ ok: true, text: async () => '<script>window.HNF_GLOBAL_INIT = {broken};</script>' })],
+  ['缺 eLiveStatus', async () => ({ ok: true, text: async () => '<script>window.HNF_GLOBAL_INIT = {"roomInfo":{"tLiveInfo":{"lLiveChannel":88}}};</script>' })]
+]
+for (const [name, fetchImpl] of failedFetches) {
+  test(`${name} 立即将旧 LIVE authority 置 UNKNOWN，保留成功诊断且不结束 session`, async t => {
+    const { supervisor, room, session, ends } = lifecycleFixture(t, new HuyaStatusDetector({ fetchImpl }))
+    // No freshness expiry: the failed check itself must invalidate a fresh LIVE.
+    const now = Date.parse(room.last_checked_at) + 30_000
+    assert.equal(roomLiveStatus(room, 60_000, now).status, 'live')
+    await assert.rejects(supervisor.checkRoom(room))
+    assert.equal(room.metadata.liveStatusState, 'unknown')
+    assert.equal(room.metadata.liveStatus, 2)
+    assert.equal(room.metadata.liveStatusObservedAt, room.last_checked_at)
+    assert.equal(roomLiveStatus(room, 60_000, now).status, 'unknown')
+    assert.equal(session.status, 'active')
+    assert.deepEqual(ends, [])
+    await supervisor.stop()
+  })
+}
+
+test('刚启动未完成首次成功检测为 UNKNOWN，失败后仍待复核', async t => {
+  let rejectDetection
+  const gate = new Promise((_resolve, reject) => { rejectDetection = reject })
+  const { supervisor, room, session, ends } = lifecycleFixture(t, { detect: () => gate })
+  await supervisor.start()
+  assert.equal(room.metadata.liveStatusState, 'unknown')
+  assert.equal(roomLiveStatus(room, 60_000, Date.parse(room.last_checked_at)).status, 'unknown')
+  rejectDetection(new Error('HTTP 503'))
+  await supervisor.runtime.get(room.id).checkDone
+  assert.equal(session.status, 'active')
+  assert.deepEqual(ends, [])
+  await supervisor.stop()
+})
+
+test('UNKNOWN 打断离线连续确认，不能用于结束真实场次，成功后恢复', async t => {
+  let result = detection('offline')
+  const { supervisor, room, ends } = lifecycleFixture(t, { detect: async () => {
+    if (result instanceof Error) throw result
+    return result
+  } })
+  await supervisor.checkRoom(room)
+  result = new Error('timeout')
+  await assert.rejects(supervisor.checkRoom(room))
+  result = detection('offline')
+  await supervisor.checkRoom(room)
+  assert.deepEqual(ends, [])
+  result = detection()
+  await supervisor.checkRoom(room)
+  assert.equal(room.metadata.liveStatusState, 'live')
+  assert.equal(supervisor.runtime.get(room.id).offlineCount, 0)
+  await supervisor.stop()
+})
+
+test('collector 启动失败不覆盖成功的平台 LIVE authority', async t => {
+  const { supervisor, room, ends } = lifecycleFixture(t, { detect: async () => detection() })
+  t.mock.method(HuyaDanmu.prototype, 'start', async () => { throw new Error('collector unavailable') })
+  await assert.rejects(supervisor.checkRoom(room), /collector unavailable/)
+  assert.equal(room.metadata.liveStatusState, 'live')
+  assert.equal(room.runtime_status, 'degraded')
+  assert.deepEqual(ends, [])
+  await supervisor.stop()
+})
+
+test('停止服务取消未完成的检测，晚到 LIVE 不启动 collector 或完成 session', async t => {
+  let resolveDetection
+  const gate = new Promise(resolve => { resolveDetection = resolve })
+  const { supervisor, room, session, ends } = lifecycleFixture(t, { detect: () => gate })
+  const check = supervisor.checkRoom(room)
+  const stopped = supervisor.stop()
+  resolveDetection(detection())
+  await Promise.all([check, stopped])
+  assert.equal(supervisor.runtime.size, 0)
+  assert.equal(room.metadata.liveStatusState, 'unknown')
+  assert.equal(session.status, 'active')
+  assert.deepEqual(ends, [])
+})
+
+test('停服时正在复核 OFFLINE 的孤儿 session 不被错误 completed', async t => {
+  const { supervisor, database, room, session, ends } = lifecycleFixture(t, { detect: async () => detection('offline') })
+  await supervisor.checkRoom(room)
+  const state = supervisor.runtime.get(room.id)
+  state.session = null
+  let resolveLookup
+  let lookupStarted
+  const started = new Promise(resolve => { lookupStarted = resolve })
+  database.getActiveSession = () => {
+    lookupStarted()
+    return new Promise(resolve => { resolveLookup = resolve })
+  }
+  const check = supervisor.checkRoom(room)
+  await started
+  const stopped = supervisor.stop()
+  resolveLookup(session)
+  await Promise.all([check, stopped])
+  assert.equal(session.status, 'active')
+  assert.deepEqual(ends, [])
+  assert.equal(room.metadata.liveStatusState, 'unknown')
 })

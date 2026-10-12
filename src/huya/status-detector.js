@@ -1,4 +1,5 @@
 const USER_AGENT = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36'
+const { LIVE_STATUS_SOURCE, parsePlatformLiveStatus } = require('../services/live-status')
 
 function extractGlobalInit(html) {
   const match = String(html).match(/window\.HNF_GLOBAL_INIT\s*=\s*(\{.*?\})\s*;?\s*<\/script>/s)
@@ -12,26 +13,42 @@ function extractGlobalInit(html) {
   }
 }
 
-function parseRoomStatus(html, roomId, checkedAt = new Date()) {
+function parseRoomStatus(html, roomId, checkedAt) {
   const init = extractGlobalInit(html)
   const roomInfo = init.roomInfo || {}
   const profile = roomInfo.tProfileInfo || init.roomProfile || {}
   const liveInfo = roomInfo.tLiveInfo || {}
   const anchorUid = profile.lUid || profile.lYyid || init.roomProfile?.lUid
-  const liveStatus = Number(roomInfo.eLiveStatus)
-  const hasChannel = Number(liveInfo.lChannelId || roomInfo.lChannelId || 0) > 0
+  const liveStatus = parsePlatformLiveStatus(roomInfo.eLiveStatus)
+  // lLiveChannel is diagnostic only: neither a channel nor its absence replaces eLiveStatus.
+  const liveChannel = parsePlatformLiveStatus(liveInfo.lLiveChannel)
 
+  if (liveStatus === null) throw new Error('无法从虎牙页面可靠解析 eLiveStatus')
   if (!anchorUid) throw new Error('无法从虎牙页面识别主播 UID')
+  const status = liveStatus === 2 ? 'live' : 'offline'
+  const rawStart = liveInfo.iStartTime
+  const startSeconds = typeof rawStart === 'number' || (typeof rawStart === 'string' && /^\d+(?:\.\d+)?$/.test(rawStart))
+    ? Number(rawStart) : NaN
+  const startDate = new Date(startSeconds * 1000)
+  const liveStartedAt = status === 'live' && Number.isFinite(startSeconds) && startSeconds > 0 && Number.isFinite(startDate.getTime())
+    ? startDate.toISOString() : null
+  // Capture server observation time only after the response and status parsing succeed.
+  const observedAt = (checkedAt || new Date()).toISOString()
 
   return {
-    status: liveStatus === 2 || (Number.isNaN(liveStatus) && hasChannel) ? 'live' : 'offline',
+    status,
     roomId: String(roomId),
     anchorUid: String(anchorUid),
     anchorName: profile.sNick || profile.sNickName || null,
-    checkedAt: checkedAt.toISOString(),
-    source: 'm.huya.com:HNF_GLOBAL_INIT',
+    checkedAt: observedAt,
+    source: LIVE_STATUS_SOURCE,
     metadata: {
-      liveStatus: Number.isNaN(liveStatus) ? null : liveStatus,
+      liveStatus,
+      liveStatusState: status,
+      liveStatusObservedAt: observedAt,
+      liveStartedAt,
+      liveChannel,
+      // Do not copy lLiveId: JSON.parse may have rounded its 19-digit integer.
       title: liveInfo.sIntroduction || liveInfo.sRoomName || null,
       category: liveInfo.sGameFullName || liveInfo.sGameName || null
     }
@@ -45,14 +62,13 @@ class HuyaStatusDetector {
   }
 
   async detect(roomId) {
-    const checkedAt = new Date()
     const response = await this.fetch(`https://m.huya.com/${encodeURIComponent(String(roomId))}`, {
       headers: { 'user-agent': USER_AGENT },
       signal: AbortSignal.timeout(this.timeoutMs),
       redirect: 'follow'
     })
     if (!response.ok) throw new Error(`虎牙页面请求失败：HTTP ${response.status}`)
-    return parseRoomStatus(await response.text(), roomId, checkedAt)
+    return parseRoomStatus(await response.text(), roomId)
   }
 }
 

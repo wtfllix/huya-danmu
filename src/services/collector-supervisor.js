@@ -36,12 +36,15 @@ class CollectorSupervisor {
     this.logger = logger
     this.runtime = new Map()
     this.started = false
+    this.lifecycle = 0
     this.metrics = { chat: 0, gift: 0, paid_message_snapshot: 0, online: 0, errors: 0, parseErrors: 0, reconnects: 0, statusCheckErrors: 0 }
   }
 
   async start() {
     if (this.started) return
+    await this.database.resetLiveStatusAuthorities()
     this.started = true
+    this.lifecycle += 1
     if (this.config.initialRoomId && !(await this.database.getRoomByExternalId(this.config.initialRoomId))) {
       await this.database.createRoom({
         externalRoomId: this.config.initialRoomId
@@ -55,7 +58,18 @@ class CollectorSupervisor {
   async stop() {
     clearInterval(this.timer)
     this.started = false
-    for (const state of this.runtime.values()) state.client?.stop()
+    this.lifecycle += 1
+    const states = [...this.runtime.values()]
+    for (const state of states) {
+      state.cancelled = true
+      const client = state.client
+      state.client = null
+      state.ready = false
+      client?.stop()
+    }
+    // Drain in-flight checks before closing the database; shutdown is not a platform OFFLINE.
+    await Promise.all(states.map(state => state.checkDone))
+    await this.database.resetLiveStatusAuthorities()
     this.runtime.clear()
   }
 
@@ -71,8 +85,10 @@ class CollectorSupervisor {
   }
 
   async tick() {
+    const lifecycle = this.lifecycle
     const rooms = await this.database.listRooms()
     for (const room of rooms) {
+      if (lifecycle !== this.lifecycle) return
       if (!room.enabled) {
         await this.stopCollector(room, 'disabled')
         continue
@@ -87,17 +103,33 @@ class CollectorSupervisor {
     if (state.checking) return
     state.cancelled = false
     state.checking = true
+    let finishCheck
+    state.checkDone = new Promise(resolve => { finishCheck = resolve })
     try {
-      const result = await this.detector.detect(room.external_room_id)
+      let result
+      try {
+        result = await this.detector.detect(room.external_room_id)
+      } catch (error) {
+        if (state.cancelled) return
+        state.offlineCount = 0
+        await this.database.recordLiveStatusFailure(room.id)
+        throw error
+      }
       if (state.cancelled) return
       await this.database.recordStatusCheck(room.id, result)
+      if (state.cancelled) return
       if (result.status === 'live') {
         state.offlineCount = 0
         if (!state.client) await this.startCollector(room, result, state)
-        else if (state.ready) await this.database.setRoomStatus(room.id, 'listening', { error: null })
+        else {
+          // A later successful poll may supply the platform start missing on the first poll.
+          state.session = await this.database.startSession(room.id, result.metadata)
+          if (!state.cancelled && state.ready) await this.database.setRoomStatus(room.id, 'listening', { error: null })
+        }
       } else {
         state.offlineCount += 1
         const activeSession = state.session || await this.database.getActiveSession(room.id)
+        if (state.cancelled) return
         if (activeSession && state.offlineCount >= this.config.offlineConfirmations) {
           await this.stopCollector(room, 'offline')
         } else if (activeSession) {
@@ -108,6 +140,7 @@ class CollectorSupervisor {
         }
       }
     } catch (error) {
+      if (state.cancelled) return
       this.metrics.statusCheckErrors += 1
       const status = state.client ? 'degraded' : 'unknown'
       await this.database.setRoomStatus(room.id, status, {
@@ -117,14 +150,17 @@ class CollectorSupervisor {
       throw error
     } finally {
       state.checking = false
+      finishCheck()
     }
   }
 
   async startCollector(room, detection, state = this.runtime.get(room.id)) {
     const session = await this.database.startSession(room.id, detection.metadata)
+    if (state.cancelled) return
     state.session = session
     state.ready = false
     await this.database.setRoomStatus(room.id, 'starting', { reason: 'live_detected', source: detection.source })
+    if (state.cancelled) return
     const client = new HuyaDanmu({
       roomid: room.external_room_id,
       proxy: this.config.proxy || undefined,
@@ -134,6 +170,7 @@ class CollectorSupervisor {
     state.client = client
 
     client.on('ready', () => {
+      if (state.cancelled || state.client !== client) return
       state.ready = true
       this.database.setRoomStatus(room.id, 'listening', { reason: 'subscription_ready', error: null })
         .catch(error => this.logger.error?.({ error, roomId: room.id }, '更新监听状态失败'))
@@ -146,6 +183,7 @@ class CollectorSupervisor {
       }, '虎牙消息解析失败')
     })
     client.on('error', error => {
+      if (state.cancelled || state.client !== client) return
       this.metrics.errors += 1
       this.logger.error?.({ error, roomId: room.id }, '虎牙采集连接异常')
       this.database.setRoomStatus(room.id, 'degraded', {
@@ -162,18 +200,23 @@ class CollectorSupervisor {
       }
     })
     await client.start()
+    // start() can finish its own HTTP lookup after stop(); close any late connection.
+    if (state.cancelled) client.stop()
   }
 
   async stopCollector(room, reason) {
     const state = this.runtime.get(room.id)
     if (state && reason === 'disabled') state.cancelled = true
     if (state?.client) {
-      state.client.stop()
+      const client = state.client
       state.client = null
+      client.stop()
+    }
+    if (state) {
       state.session = null
       state.ready = false
     }
-    await this.database.endSession(room.id)
+    await this.database.endSession(room.id, reason === 'disabled' ? 'interrupted' : 'completed')
     await this.database.setRoomStatus(room.id, reason === 'disabled' ? 'disabled' : 'offline', { reason })
   }
 

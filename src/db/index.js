@@ -6,6 +6,7 @@ const { Pool } = require('pg')
 const QueryStream = require('pg-query-stream')
 const { normalizeContent, sha256 } = require('../utils')
 const { windowTopMessages } = require('./window-top-messages')
+const { validIsoTime } = require('../services/live-status')
 
 class Database {
   constructor({ connectionString, ssl = false, logger = console }) {
@@ -169,11 +170,34 @@ class Database {
   }
 
   async recordStatusCheck(roomId, result) {
+    const observedAt = validIsoTime(result.checkedAt)
+    if (!observedAt || !['live', 'offline'].includes(result.status)) throw new Error('无效的平台状态观察')
     await this.query(
       `UPDATE rooms SET anchor_uid = COALESCE($2, anchor_uid), anchor_name = COALESCE($3, anchor_name),
        last_checked_at = $4, metadata = metadata || $5::jsonb, last_error = NULL, updated_at = now()
        WHERE id = $1`,
-      [roomId, result.anchorUid, result.anchorName, result.checkedAt, result.metadata || {}]
+      [roomId, result.anchorUid, result.anchorName, observedAt, {
+        ...result.metadata,
+        liveStatusState: result.status,
+        liveStatusObservedAt: observedAt,
+        liveStartedAt: result.status === 'live' ? validIsoTime(result.metadata?.liveStartedAt) : null
+      }]
+    )
+  }
+
+  async recordLiveStatusFailure(roomId) {
+    // Keep last successful raw status, observation time and last_checked_at for diagnosis.
+    await this.query(
+      `UPDATE rooms SET metadata = metadata || '{"liveStatusState":"unknown"}'::jsonb,
+       updated_at = now() WHERE id = $1`, [roomId]
+    )
+  }
+
+  async resetLiveStatusAuthorities() {
+    // A new process must recheck persisted observations before claiming LIVE/OFFLINE.
+    await this.query(
+      `UPDATE rooms SET metadata = metadata || '{"liveStatusState":"unknown"}'::jsonb,
+       updated_at = now() WHERE deleted_at IS NULL`
     )
   }
 
@@ -186,12 +210,21 @@ class Database {
   }
 
   async startSession(roomId, metadata = {}) {
+    const platformStartedAt = validIsoTime(metadata.liveStartedAt)
     const active = await this.getActiveSession(roomId)
-    if (active) return active
+    if (active) {
+      if (active.platform_started_at || !platformStartedAt) return active
+      const { rows } = await this.query(
+        `UPDATE live_sessions SET platform_started_at = COALESCE(platform_started_at, $2::timestamptz),
+         metadata = metadata || $3::jsonb, updated_at = now() WHERE id = $1 RETURNING *`,
+        [active.id, platformStartedAt, metadata]
+      )
+      return rows[0]
+    }
     const { rows } = await this.query(
-      `INSERT INTO live_sessions(id, room_id, detected_started_at, status, metadata)
-       VALUES ($1, $2, now(), 'active', $3) RETURNING *`,
-      [crypto.randomUUID(), roomId, metadata]
+      `INSERT INTO live_sessions(id, room_id, detected_started_at, status, metadata, platform_started_at)
+       VALUES ($1, $2, now(), 'active', $3, $4) RETURNING *`,
+      [crypto.randomUUID(), roomId, metadata, platformStartedAt]
     )
     return rows[0]
   }

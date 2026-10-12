@@ -4,6 +4,7 @@ const fastifyStatic = require('@fastify/static')
 const { clampLimit, parseDate } = require('./utils')
 const { parseWindowQuery, createWindowTopService } = require('./services/window-top-service')
 const { RealtimeEventBus } = require('./services/realtime-event-bus')
+const { roomLiveStatus } = require('./services/live-status')
 
 const REALTIME_TOP_CACHE_TTL_MS = 5_000
 
@@ -162,6 +163,13 @@ function buildApp({ config, database, detector, supervisor, spool, storage, arch
     const room = await database.getRoom(request.params.id)
     if (!room) throw Object.assign(new Error('房间不存在'), { statusCode: 404 })
     return room
+  })
+
+  app.get('/api/v1/rooms/:id/live-status', async (request, reply) => {
+    const room = await database.getRoom(request.params.id)
+    if (!room) throw Object.assign(new Error('房间不存在'), { statusCode: 404 })
+    reply.header('Cache-Control', 'no-store')
+    return roomLiveStatus(room, config.pollIntervalMs)
   })
 
   app.patch('/api/v1/rooms/:id', async request => {
