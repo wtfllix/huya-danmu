@@ -75,7 +75,8 @@ Compose 创建三个持久卷：
 | `ALERT_WEBHOOK_URL` | 空 | 磁盘水位变化时接收 JSON 的 Webhook |
 | `LIVE_POLL_INTERVAL_SECONDS` | `60` | 开播状态检测间隔，最小 15 秒 |
 | `OFFLINE_CONFIRMATIONS` | `2` | 确认下播所需连续离线次数 |
-| `HOT_RETENTION_MONTHS` | `12` | PostgreSQL 热数据月数 |
+| `HOT_RETENTION_DAYS` | `30` | 业务数据保留天数；`danmu_messages` 按天分区，过期整日分区直接 DROP |
+| `HOT_RETENTION_MONTHS` | `12` | 归档兜底阈值：仅保留超过该月数的分区才会被归档成 Parquet |
 | `RAW_PAYLOAD_RETENTION_DAYS` | `30` | 调试用完整协议载荷保留天数 |
 | `STORAGE_SAMPLE_MINUTES` | `60` | 磁盘容量采样周期 |
 | `DATABASE_STORAGE_PATH` | 空 | 应用可读的数据库文件系统路径 |

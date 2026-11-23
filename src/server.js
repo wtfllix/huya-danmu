@@ -84,7 +84,14 @@ async function main() {
     try {
       const dates = await database.pendingDailyTopDates()
       for (const date of dates) await database.finalizeDailyTop(date)
-      await database.runMaintenance(config.rawPayloadRetentionDays)
+      const maintenance = await database.runMaintenance(config.rawPayloadRetentionDays, config.hotRetentionDays)
+      app.log.info({
+        retentionDays: maintenance.pruned.retentionDays,
+        deleted: maintenance.pruned.deleted,
+        droppedPartitions: maintenance.pruned.droppedPartitions,
+        clearedPayloads: maintenance.clearedPayloads,
+        clearedWorkingCounts: maintenance.clearedWorkingCounts
+      }, '保留策略执行完成')
       await archives.archiveDue(config.hotRetentionMonths)
     } catch (error) {
       app.log.error({ err: error }, '每日维护任务失败')

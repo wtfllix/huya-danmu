@@ -2,6 +2,7 @@ const fs = require('node:fs/promises')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const parquet = require('parquetjs-lite')
+const { parsePartitionName } = require('../db/partition')
 
 const schema = new parquet.ParquetSchema({
   ingest_id: { type: 'UTF8', compression: 'GZIP' },
@@ -29,16 +30,11 @@ async function fileHash(file) {
   return hash.digest('hex')
 }
 
+// 兼容按天分区（danmu_messages_2026_11_24）与历史月分区（danmu_messages_2026_11）
 function partitionRange(tableName) {
-  const match = tableName.match(/^danmu_messages_(\d{4})_(\d{2})$/)
-  if (!match) throw new Error('非法弹幕分区名称')
-  const year = Number(match[1])
-  const month = Number(match[2]) - 1
-  return {
-    start: new Date(Date.UTC(year, month, 1)),
-    end: new Date(Date.UTC(year, month + 1, 1)),
-    label: `${match[1]}-${match[2]}`
-  }
+  const parsed = parsePartitionName(tableName)
+  if (!parsed) throw new Error('非法弹幕分区名称')
+  return { start: parsed.start, end: parsed.end, label: parsed.label }
 }
 
 class ArchiveService {

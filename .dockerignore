@@ -1,9 +1,14 @@
 .git
 .agents
 .codex
+# 密钥与备份不得打进镜像
 .env
+.env.*
+!.env.example
+backups
+backup
+migration
 node_modules
 data
-backup
 test
 npm-debug.log

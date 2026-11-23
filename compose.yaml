@@ -24,6 +24,10 @@ services:
   app:
     build: .
     restart: unless-stopped
+    # 保护标记：/root/scripts/docker-prune.sh 会跳过带 keep 标签的已停止容器，
+    # 避免容器异常退出后被 prune 删掉、再也不会自动拉起的惨剧
+    labels:
+      - keep=true
     depends_on:
       postgres:
         condition: service_healthy

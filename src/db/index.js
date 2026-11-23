@@ -6,6 +6,7 @@ const { Pool } = require('pg')
 const QueryStream = require('pg-query-stream')
 const { normalizeContent, sha256 } = require('../utils')
 const { windowTopMessages } = require('./window-top-messages')
+const { PARTITION_NAME_PATTERN, dayBounds, messagePartitionName, parsePartitionName } = require('./partition')
 const { validIsoTime } = require('../services/live-status')
 
 class Database {
@@ -66,22 +67,26 @@ class Database {
     await this.pool.end()
   }
 
+  // 按天建分区，便于保留策略直接 DROP 整日分区（DROP 才能立即归还磁盘）
   async ensureMessagePartition(dateValue, client = this.pool) {
-    const date = new Date(dateValue)
-    const year = date.getUTCFullYear()
-    const month = date.getUTCMonth()
-    const key = `${year}_${String(month + 1).padStart(2, '0')}`
-    if (this.partitionCache.has(key)) return
-    const start = new Date(Date.UTC(year, month, 1)).toISOString()
-    const end = new Date(Date.UTC(year, month + 1, 1)).toISOString()
-    const table = `danmu_messages_${key}`
-    await client.query(
-      `CREATE TABLE IF NOT EXISTS ${table} PARTITION OF danmu_messages
-       FOR VALUES FROM ('${start}') TO ('${end}')`
-    )
+    const { start, end } = dayBounds(dateValue)
+    const table = messagePartitionName(dateValue)
+    if (this.partitionCache.has(table)) return
+    try {
+      await client.query(
+        `CREATE TABLE IF NOT EXISTS ${table} PARTITION OF danmu_messages
+         FOR VALUES FROM ('${start.toISOString()}') TO ('${end.toISOString()}')`
+      )
+    } catch (error) {
+      // 42P17: 该范围已被旧的历史月分区覆盖，插入会落到覆盖分区上，跳过即可
+      if (!['42P17', '23P01'].includes(error.code)) throw error
+      this.logger.warn?.({ table }, '该日期已有覆盖分区，跳过按日分区创建')
+      this.partitionCache.add(table)
+      return
+    }
     await client.query(`CREATE INDEX IF NOT EXISTS ${table}_room_time_idx ON ${table} (room_id, occurred_at DESC)`)
     await client.query(`CREATE INDEX IF NOT EXISTS ${table}_sender_time_idx ON ${table} (room_id, sender_uid, occurred_at DESC)`)
-    this.partitionCache.add(key)
+    this.partitionCache.add(table)
   }
 
   async listRooms() {
@@ -730,20 +735,20 @@ class Database {
        FROM pg_inherits
        JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
        JOIN pg_class child ON pg_inherits.inhrelid = child.oid
-       WHERE parent.relname = 'danmu_messages' AND child.relname ~ '^danmu_messages_[0-9]{4}_[0-9]{2}$'
+       WHERE parent.relname = 'danmu_messages' AND child.relname ~ '${PARTITION_NAME_PATTERN}'
        ORDER BY child.relname`
     )
+    const limit = new Date(cutoff).getTime()
     return rows.filter(row => {
-      const match = row.table_name.match(/(\d{4})_(\d{2})$/)
-      const end = new Date(Date.UTC(Number(match[1]), Number(match[2]), 1))
-      return end <= new Date(cutoff)
+      const parsed = parsePartitionName(row.table_name)
+      return parsed && parsed.end.getTime() <= limit
     })
   }
 
   async dropMessagePartition(tableName) {
-    if (!/^danmu_messages_\d{4}_\d{2}$/.test(tableName)) throw new Error('非法分区名称')
+    if (!parsePartitionName(tableName)) throw new Error('非法分区名称')
     await this.query(`DROP TABLE ${tableName}`)
-    this.partitionCache.delete(tableName.slice('danmu_messages_'.length))
+    this.partitionCache.delete(tableName)
   }
 
   async createArchiveRun({ rangeStart, rangeEnd }) {
@@ -784,7 +789,57 @@ class Database {
     return rows
   }
 
-  async runMaintenance(rawPayloadRetentionDays = 30) {
+  // 保留策略：只保留最近 retentionDays 天的业务数据
+  // 1) 时间序列表按时间删除旧行（stream_events 等未分区表靠空间复用保持稳定体积）
+  // 2) 完全过期的弹幕分区直接 DROP，DROP 才会真正把磁盘空间还给系统
+  async pruneExpired(retentionDays = 30) {
+    const days = Math.max(1, Math.floor(Number(retentionDays) || 30))
+    const interval = `${days} days`
+    const deleteCount = async sql => Number((await this.query(sql, [interval])).rows[0].count)
+    const deleted = {
+      danmuMessages: await deleteCount(
+        `WITH d AS (DELETE FROM danmu_messages WHERE occurred_at < now() - $1::interval RETURNING 1)
+         SELECT count(*) AS count FROM d`
+      ),
+      streamEvents: await deleteCount(
+        `WITH d AS (DELETE FROM stream_events WHERE occurred_at < now() - $1::interval RETURNING 1)
+         SELECT count(*) AS count FROM d`
+      ),
+      roomStatusHistory: await deleteCount(
+        `WITH d AS (DELETE FROM room_status_history WHERE created_at < now() - $1::interval RETURNING 1)
+         SELECT count(*) AS count FROM d`
+      ),
+      danmuMinuteStats: await deleteCount(
+        `WITH d AS (DELETE FROM danmu_minute_stats WHERE bucket_at < now() - $1::interval RETURNING 1)
+         SELECT count(*) AS count FROM d`
+      ),
+      storageSnapshots: await deleteCount(
+        `WITH d AS (DELETE FROM storage_snapshots WHERE sampled_at < now() - $1::interval RETURNING 1)
+         SELECT count(*) AS count FROM d`
+      ),
+      danmuDailyStats: await deleteCount(
+        `WITH d AS (DELETE FROM danmu_daily_stats
+          WHERE local_date < (now() AT TIME ZONE 'Asia/Shanghai')::date - $1::interval RETURNING 1)
+         SELECT count(*) AS count FROM d`
+      ),
+      danmuDailyTopMessages: await deleteCount(
+        `WITH d AS (DELETE FROM danmu_daily_top_messages
+          WHERE local_date < (now() AT TIME ZONE 'Asia/Shanghai')::date - $1::interval RETURNING 1)
+         SELECT count(*) AS count FROM d`
+      )
+    }
+
+    const cutoff = new Date(Date.now() - days * 86400000)
+    const droppedPartitions = []
+    for (const partition of await this.listMessagePartitionsBefore(cutoff)) {
+      await this.dropMessagePartition(partition.table_name)
+      droppedPartitions.push(partition.table_name)
+    }
+
+    return { retentionDays: days, deleted, droppedPartitions }
+  }
+
+  async runMaintenance(rawPayloadRetentionDays = 30, retentionDays = 30) {
     const clearedPayloads = await this.query(
       `UPDATE danmu_messages SET raw_payload = NULL
        WHERE raw_payload IS NOT NULL AND occurred_at < now() - ($1::text || ' days')::interval`,
@@ -794,7 +849,12 @@ class Database {
       `DELETE FROM danmu_daily_content_counts WHERE local_date <
        (now() AT TIME ZONE 'Asia/Shanghai')::date - 7`
     )
-    return { clearedPayloads: clearedPayloads.rowCount, clearedWorkingCounts: clearedWorkingCounts.rowCount }
+    const pruned = await this.pruneExpired(retentionDays)
+    return {
+      clearedPayloads: clearedPayloads.rowCount,
+      clearedWorkingCounts: clearedWorkingCounts.rowCount,
+      pruned
+    }
   }
 }
 

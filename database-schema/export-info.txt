@@ -1,0 +1,7 @@
+Export Time: 2026-09-20 02:16:16 CST
+PostgreSQL Version: 17.11
+Database: huya_danmu
+Schemas: public
+Schema File: database-schema/schema.sql
+Schema File Size: 17288 bytes
+Git Commit: 96874dd5c95144fb75b2d4bed761e6dd9957e891

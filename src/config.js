@@ -54,6 +54,8 @@ function loadConfig() {
       : null,
     storageSampleMinutes: integer('STORAGE_SAMPLE_MINUTES', 60, 1),
     hotRetentionMonths: integer('HOT_RETENTION_MONTHS', 12, 1),
+    // 业务数据保留天数：danmu_messages / stream_events / room_status_history 等只留最近 N 天
+    hotRetentionDays: integer('HOT_RETENTION_DAYS', 30, 1),
     rawPayloadRetentionDays: integer('RAW_PAYLOAD_RETENTION_DAYS', 30, 1),
     allowInsecureWs: boolean('HUYA_ALLOW_INSECURE_WS'),
     proxy: process.env.HUYA_PROXY || '',
